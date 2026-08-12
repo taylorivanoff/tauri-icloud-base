@@ -1,0 +1,283 @@
+//! Shared Tauri shell for iCloud / Apple web wrappers.
+
+mod cookies;
+
+use std::path::PathBuf;
+
+use tauri::webview::NewWindowResponse;
+use tauri::{
+    AppHandle, Context, Listener, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+};
+use tauri_plugin_opener::OpenerExt;
+use tauri_tray_base::{
+    apply_window_settings, install_state, on_window_event, set_on_before_quit, setup_tray,
+    was_launched_minimised, with_common_plugins, TrayBaseOptions, TrayClickAction, TrayExtraItem,
+    TraySetupOptions, MAIN_WINDOW_LABEL,
+};
+use url::Url;
+
+const SAFARI_UA: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+
+/// Safari UA makes iCloud request Apple fonts. Remap to Segoe UI on Windows WebView2.
+const FONT_FIX_SCRIPT: &str = r#"
+(function () {
+  var css = [
+    '@font-face{font-family:"-apple-system";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:"BlinkMacSystemFont";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:"SF Pro Text";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:"SF Pro Display";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:"SF Pro";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:"SFNS Text";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:"SFNSDisplay";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:".SF NS Text";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:".SF NS Display";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:"Helvetica Neue";src:local("Segoe UI"),local("Arial");}',
+    '@font-face{font-family:"Apple Color Emoji";src:local("Segoe UI Emoji"),local("Segoe UI Symbol");}',
+    'html,body,p,span,div,li,td,th,input,textarea,[contenteditable],.ck-content,.ProseMirror{',
+    'font-family:"Segoe UI","Helvetica Neue",Arial,sans-serif !important;',
+    '}'
+  ].join('');
+  function inject() {
+    var s = document.getElementById('icloud-win-font-fix');
+    if (!s) {
+      s = document.createElement('style');
+      s.id = 'icloud-win-font-fix';
+      (document.head || document.documentElement).appendChild(s);
+    }
+    s.textContent = css;
+  }
+  inject();
+  if (!window.__icloudWinFontFix) {
+    window.__icloudWinFontFix = true;
+    document.addEventListener('DOMContentLoaded', inject);
+  }
+})();
+"#;
+
+const TOOLBAR_REMOVE_SCRIPT: &str = r#"
+(function () {
+  const SELECTORS = [
+    '.cloudos-toolbar-view',
+    'header.cloudos-toolbar.app',
+    'header.cloudos-toolbar'
+  ];
+  function removeToolbar(root) {
+    root = root || document;
+    for (const selector of SELECTORS) {
+      root.querySelectorAll?.(selector)?.forEach((el) => el.remove());
+    }
+    for (const frame of root.querySelectorAll?.('iframe') || []) {
+      try {
+        const doc = frame.contentDocument;
+        if (doc) removeToolbar(doc);
+      } catch (_) {}
+    }
+  }
+  removeToolbar();
+  if (!window.__icloudBaseToolbarObserver) {
+    let scheduled = false;
+    window.__icloudBaseToolbarObserver = new MutationObserver(() => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        removeToolbar();
+      });
+    });
+    window.__icloudBaseToolbarObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true
+    });
+  }
+})();
+"#;
+
+/// Product config for an iCloud / Apple web wrapper.
+#[derive(Debug, Clone, Copy)]
+pub struct IcloudAppConfig {
+    pub app_name: &'static str,
+    pub url: &'static str,
+    pub remove_toolbar: bool,
+}
+
+fn parse_app_url(url: &str) -> Url {
+    Url::parse(url).unwrap_or_else(|_| Url::parse("https://www.icloud.com").expect("fallback"))
+}
+
+fn is_icloud_home_redirect(url: &Url, app_url: &Url) -> bool {
+    let Some(app_host) = app_url.host_str() else {
+        return false;
+    };
+    if !(app_host == "www.icloud.com" || app_host == "icloud.com") {
+        return false;
+    }
+    let app_path = app_url.path().trim_end_matches('/');
+    if app_path.is_empty() || app_path == "/" {
+        return false;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if !(host == "www.icloud.com" || host == "icloud.com") {
+        return false;
+    }
+    let path = url.path().trim_end_matches('/');
+    path.is_empty() || path == "/"
+}
+
+fn persist_cookies(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let app2 = app.clone();
+        let window2 = window.clone();
+        let _ = std::thread::Builder::new()
+            .name("cookie-persist".into())
+            .spawn(move || {
+                if let Err(e) = cookies::save_persisted_cookies(&app2, &window2) {
+                    eprintln!("[cookies] persist: {e}");
+                }
+            });
+    }
+}
+
+fn refresh_page(app: &AppHandle, url: Url) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.navigate(url);
+    }
+}
+
+fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<WebviewWindow> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let webview_data = app_data.join("webview");
+    let _ = std::fs::create_dir_all(&webview_data);
+
+    let app_url = parse_app_url(config.url);
+    let app_for_nav = app.clone();
+    let app_for_open = app.clone();
+    let nav_target = app_url.clone();
+    let remove_toolbar = config.remove_toolbar;
+
+    let mut builder =
+        WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::External(app_url.clone()))
+            .title(config.app_name)
+            .inner_size(1280.0, 800.0)
+            .resizable(true)
+            .user_agent(SAFARI_UA)
+            .data_directory(webview_data)
+            .initialization_script_for_all_frames(FONT_FIX_SCRIPT);
+
+    if remove_toolbar {
+        builder = builder.initialization_script_for_all_frames(TOOLBAR_REMOVE_SCRIPT);
+    }
+
+    builder
+        .on_page_load(move |window, _payload| {
+            let _ = window.eval(FONT_FIX_SCRIPT);
+            if remove_toolbar {
+                let _ = window.eval(TOOLBAR_REMOVE_SCRIPT);
+            }
+        })
+        .on_navigation(move |url| {
+            if is_icloud_home_redirect(url, &nav_target) {
+                let handle = app_for_nav.clone();
+                let target = nav_target.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    if let Some(w) = handle.get_webview_window(MAIN_WINDOW_LABEL) {
+                        let _ = w.navigate(target);
+                    }
+                });
+                return false;
+            }
+            true
+        })
+        .on_new_window(move |url, _features| {
+            let href = url.as_str().to_string();
+            if href != "about:blank#blocked" && !href.starts_with("about:blank") {
+                let _ = app_for_open.opener().open_url(href, None::<&str>);
+            }
+            NewWindowResponse::Deny
+        })
+        .build()
+}
+
+/// Run a tray-first iCloud/Apple web wrapper.
+///
+/// `context` must come from the **app** crate via `tauri::generate_context!()`.
+pub fn run(config: IcloudAppConfig, context: Context) {
+    let app_url = parse_app_url(config.url);
+    let builder = with_common_plugins(tauri::Builder::default());
+
+    builder
+        .setup(move |app| {
+            let handle = app.handle().clone();
+
+            install_state(
+                &handle,
+                TrayBaseOptions {
+                    app_name: config.app_name.into(),
+                    show_hide: false,
+                    show_always_on_top: false,
+                    tray_on_click: TrayClickAction::Toggle,
+                    extra_tray_items: vec![TrayExtraItem {
+                        id: "refresh".into(),
+                        label: "Refresh".into(),
+                    }],
+                    ..Default::default()
+                },
+            )?;
+
+            let window = build_main_window(&handle, config)?;
+
+            if was_launched_minimised() {
+                let _ = window.hide();
+            }
+
+            setup_tray(
+                &handle,
+                TraySetupOptions {
+                    tooltip: Some(config.app_name.into()),
+                },
+            )?;
+
+            apply_window_settings(&handle);
+
+            let quit_app = handle.clone();
+            set_on_before_quit(&handle, move || {
+                persist_cookies(&quit_app);
+            });
+
+            let restore_app = handle.clone();
+            let restore_win = window.clone();
+            std::thread::spawn(move || {
+                match cookies::load_persisted_cookies(&restore_app, &restore_win) {
+                    Ok(true) => eprintln!("[cookies] restored persisted Apple cookies"),
+                    Ok(false) => eprintln!("[cookies] no persisted cookies"),
+                    Err(e) => eprintln!("[cookies] restore: {e}"),
+                }
+                cookies::start_cookie_poller(restore_app, restore_win);
+            });
+
+            let refresh_handle = handle.clone();
+            let refresh_url = app_url.clone();
+            handle.listen("tray:action", move |event| {
+                if event.payload().trim_matches('"') == "refresh" {
+                    refresh_page(&refresh_handle, refresh_url.clone());
+                }
+            });
+
+            Ok(())
+        })
+        .on_window_event(|window, event| on_window_event(window, &event))
+        .build(context)
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let RunEvent::ExitRequested { .. } = event {
+                // Cookies persist via before-quit; do not block the UI thread here.
+            }
+        });
+}
