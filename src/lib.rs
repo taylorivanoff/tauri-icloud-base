@@ -11,8 +11,8 @@ use tauri::{
 use tauri_plugin_opener::OpenerExt;
 use tauri_tray_base::{
     apply_window_settings, install_state, on_window_event, set_on_before_quit, setup_tray,
-    was_launched_minimised, with_common_plugins, TrayBaseOptions, TrayClickAction, TrayExtraItem,
-    TraySetupOptions, MAIN_WINDOW_LABEL,
+    with_common_plugins, TrayBaseOptions, TrayClickAction, TrayExtraItem, TraySetupOptions,
+    MAIN_WINDOW_LABEL,
 };
 use url::Url;
 
@@ -166,6 +166,7 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
             .title(config.app_name)
             .inner_size(1280.0, 800.0)
             .resizable(true)
+            .visible(false)
             .user_agent(SAFARI_UA)
             .data_directory(webview_data)
             .initialization_script_for_all_frames(FONT_FIX_SCRIPT);
@@ -232,10 +233,6 @@ pub fn run(config: IcloudAppConfig, context: Context) {
             )?;
 
             let window = build_main_window(&handle, config)?;
-
-            if was_launched_minimised() {
-                let _ = window.hide();
-            }
 
             setup_tray(
                 &handle,
