@@ -6,16 +6,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 use cookie::SameSite;
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use time::{Duration, OffsetDateTime};
 
 const SESSION_COOKIE_TTL_SECS: i64 = 180 * 24 * 60 * 60;
+/// After restore, ignore logged-out snapshots so a login page cannot wipe cookies.json.
+const STARTUP_GUARD_SECS: u64 = 20;
 
 static APPLYING: AtomicBool = AtomicBool::new(false);
 static LAST_FINGERPRINT: Mutex<String> = Mutex::new(String::new());
+static STARTUP_GUARD_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredCookie {
@@ -57,6 +60,41 @@ fn ensure_parent(path: &Path) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
     Ok(())
+}
+
+fn begin_startup_guard() {
+    if let Ok(mut until) = STARTUP_GUARD_UNTIL.lock() {
+        *until = Some(Instant::now() + StdDuration::from_secs(STARTUP_GUARD_SECS));
+    }
+}
+
+fn in_startup_guard() -> bool {
+    STARTUP_GUARD_UNTIL
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|until| Instant::now() < until)
+        .unwrap_or(false)
+}
+
+fn has_apple_auth(cookies: &[StoredCookie]) -> bool {
+    cookies.iter().any(|c| {
+        let n = c.name.to_ascii_uppercase();
+        n.starts_with("X-APPLE-WEBAUTH") || n == "MYACINFO"
+    })
+}
+
+fn should_skip_startup_clobber(path: &Path, cookies: &[StoredCookie]) -> bool {
+    if !in_startup_guard() {
+        return false;
+    }
+    let Some(existing) = read_cookie_file(path) else {
+        return false;
+    };
+    if cookies.is_empty() && !existing.is_empty() {
+        return true;
+    }
+    has_apple_auth(&existing) && !has_apple_auth(cookies)
 }
 
 fn fingerprint(cookies: &[StoredCookie]) -> String {
@@ -136,6 +174,7 @@ pub fn load_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
         return Ok(false);
     };
 
+    begin_startup_guard();
     APPLYING.store(true, Ordering::SeqCst);
     let result = (|| {
         let mut applied = 0usize;
@@ -152,7 +191,10 @@ pub fn load_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
         if let Ok(mut fp) = LAST_FINGERPRINT.lock() {
             *fp = fingerprint(&cookies);
         }
-        Ok(applied > 0)
+        if applied == 0 {
+            return Err("no cookies applied".into());
+        }
+        Ok(true)
     })();
     APPLYING.store(false, Ordering::SeqCst);
     result
@@ -169,6 +211,10 @@ pub fn save_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
         .map_err(|e| format!("cookies(): {e}"))?;
 
     let cookies: Vec<StoredCookie> = all.iter().filter_map(serialize_cookie).collect();
+    let path = cookie_file_path(app)?;
+    if should_skip_startup_clobber(&path, &cookies) {
+        return Ok(());
+    }
     let next = fingerprint(&cookies);
     {
         let mut fp = LAST_FINGERPRINT.lock().map_err(|e| e.to_string())?;
@@ -178,7 +224,6 @@ pub fn save_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
         *fp = next;
     }
 
-    let path = cookie_file_path(app)?;
     ensure_parent(&path)?;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let json = serde_json::to_string_pretty(&cookies).map_err(|e| e.to_string())?;

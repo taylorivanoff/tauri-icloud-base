@@ -4,6 +4,7 @@ mod cookies;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tauri::webview::{DownloadEvent, NewWindowResponse};
 use tauri::{
@@ -205,16 +206,38 @@ fn is_icloud_home_redirect(url: &Url, app_url: &Url) -> bool {
 
 fn persist_cookies(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        let app2 = app.clone();
-        let window2 = window.clone();
-        let _ = std::thread::Builder::new()
-            .name("cookie-persist".into())
-            .spawn(move || {
-                if let Err(e) = cookies::save_persisted_cookies(&app2, &window2) {
-                    eprintln!("[cookies] persist: {e}");
-                }
-            });
+        if let Err(e) = cookies::save_persisted_cookies(app, &window) {
+            eprintln!("[cookies] persist: {e}");
+        }
     }
+}
+
+fn restore_session_then_navigate(app: AppHandle, window: WebviewWindow, url: Url) {
+    std::thread::spawn(move || {
+        let mut restored = false;
+        for delay_ms in [50_u64, 100, 200, 400] {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            match cookies::load_persisted_cookies(&app, &window) {
+                Ok(true) => {
+                    eprintln!("[cookies] restored persisted Apple cookies");
+                    restored = true;
+                    break;
+                }
+                Ok(false) => {
+                    eprintln!("[cookies] no persisted cookies");
+                    break;
+                }
+                Err(e) => eprintln!("[cookies] restore retry: {e}"),
+            }
+        }
+        if restored {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Err(e) = window.navigate(url) {
+            eprintln!("[cookies] navigate after restore: {e}");
+        }
+        cookies::start_cookie_poller(app, window);
+    });
 }
 
 fn refresh_page(app: &AppHandle, url: Url) {
@@ -232,6 +255,7 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
     let _ = std::fs::create_dir_all(&webview_data);
 
     let app_url = parse_app_url(config.url);
+    let blank_url = Url::parse("about:blank").expect("about:blank");
     let app_for_nav = app.clone();
     let app_for_open = app.clone();
     let app_for_download = app.clone();
@@ -240,7 +264,7 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
     let app_name = config.app_name;
 
     let mut builder =
-        WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::External(app_url.clone()))
+        WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::External(blank_url))
             .title(config.app_name)
             .inner_size(1280.0, 800.0)
             .resizable(true)
@@ -338,16 +362,7 @@ pub fn run(config: IcloudAppConfig, context: Context) {
                 persist_cookies(&quit_app);
             });
 
-            let restore_app = handle.clone();
-            let restore_win = window.clone();
-            std::thread::spawn(move || {
-                match cookies::load_persisted_cookies(&restore_app, &restore_win) {
-                    Ok(true) => eprintln!("[cookies] restored persisted Apple cookies"),
-                    Ok(false) => eprintln!("[cookies] no persisted cookies"),
-                    Err(e) => eprintln!("[cookies] restore: {e}"),
-                }
-                cookies::start_cookie_poller(restore_app, restore_win);
-            });
+            restore_session_then_navigate(handle.clone(), window, app_url.clone());
 
             let refresh_handle = handle.clone();
             let refresh_url = app_url.clone();
