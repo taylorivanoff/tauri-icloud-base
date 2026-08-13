@@ -2,12 +2,14 @@
 
 mod cookies;
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
-use tauri::webview::NewWindowResponse;
+use tauri::webview::{DownloadEvent, NewWindowResponse};
 use tauri::{
     AppHandle, Context, Listener, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_tray_base::{
     apply_window_settings, install_state, on_window_event, set_on_before_quit, setup_tray,
@@ -105,6 +107,80 @@ fn parse_app_url(url: &str) -> Url {
     Url::parse(url).unwrap_or_else(|_| Url::parse("https://www.icloud.com").expect("fallback"))
 }
 
+fn unique_download_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let parent = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("download");
+    let ext = path.extension().and_then(|s| s.to_str());
+    for i in 1..10_000 {
+        let name = match ext {
+            Some(e) => format!("{stem} ({i}).{e}"),
+            None => format!("{stem} ({i})"),
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path
+}
+
+fn downloads_destination(app: &AppHandle, suggested: &Path, url: &Url) -> PathBuf {
+    let dir = app.path().download_dir().unwrap_or_else(|_| {
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Downloads")
+    });
+    let _ = std::fs::create_dir_all(&dir);
+
+    let name = suggested
+        .file_name()
+        .map(|n| n.to_os_string())
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            url.path_segments()
+                .and_then(|mut parts| parts.next_back())
+                .filter(|s| !s.is_empty() && *s != "/")
+                .map(OsString::from)
+        })
+        .unwrap_or_else(|| OsString::from("download"));
+
+    unique_download_path(dir.join(name))
+}
+
+fn notify_download(app: &AppHandle, app_name: &str, path: Option<&Path>, success: bool) {
+    let file_name = path
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let (title, body) = if success {
+        (
+            format!("{app_name} download complete"),
+            format!("{file_name} saved to Downloads"),
+        )
+    } else {
+        (
+            format!("{app_name} download failed"),
+            format!("Could not download {file_name}"),
+        )
+    };
+    let _ = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show();
+}
+
 fn is_icloud_home_redirect(url: &Url, app_url: &Url) -> bool {
     let Some(app_host) = app_url.host_str() else {
         return false;
@@ -158,8 +234,10 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
     let app_url = parse_app_url(config.url);
     let app_for_nav = app.clone();
     let app_for_open = app.clone();
+    let app_for_download = app.clone();
     let nav_target = app_url.clone();
     let remove_toolbar = config.remove_toolbar;
+    let app_name = config.app_name;
 
     let mut builder =
         WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::External(app_url.clone()))
@@ -196,6 +274,17 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
             }
             true
         })
+        .on_download(move |_webview, event| match event {
+            DownloadEvent::Requested { url, destination } => {
+                *destination = downloads_destination(&app_for_download, destination, &url);
+                true
+            }
+            DownloadEvent::Finished { path, success, .. } => {
+                notify_download(&app_for_download, app_name, path.as_deref(), success);
+                true
+            }
+            _ => true,
+        })
         .on_new_window(move |url, _features| {
             let href = url.as_str().to_string();
             if href != "about:blank#blocked" && !href.starts_with("about:blank") {
@@ -211,7 +300,8 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
 /// `context` must come from the **app** crate via `tauri::generate_context!()`.
 pub fn run(config: IcloudAppConfig, context: Context) {
     let app_url = parse_app_url(config.url);
-    let builder = with_common_plugins(tauri::Builder::default());
+    let builder = with_common_plugins(tauri::Builder::default())
+        .plugin(tauri_plugin_notification::init());
 
     builder
         .setup(move |app| {
