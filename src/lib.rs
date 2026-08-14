@@ -2,10 +2,12 @@
 
 mod cookies;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde_json::json;
 use tauri::webview::{DownloadEvent, NewWindowResponse};
 use tauri::{
     AppHandle, Context, Listener, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
@@ -13,9 +15,9 @@ use tauri::{
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_tray_base::{
-    apply_window_settings, install_state, on_window_event, set_on_before_quit, setup_tray,
-    with_common_plugins, TrayBaseOptions, TrayClickAction, TrayExtraItem, TraySetupOptions,
-    MAIN_WINDOW_LABEL,
+    apply_opacity, apply_window_settings, install_state, on_window_event, save_settings,
+    set_on_before_quit, setup_tray, with_common_plugins, TrayBaseOptions, TrayBaseState,
+    TrayClickAction, TrayExtraItem, TraySetupOptions, MAIN_WINDOW_LABEL,
 };
 use url::Url;
 
@@ -96,11 +98,201 @@ const TOOLBAR_REMOVE_SCRIPT: &str = r#"
 })();
 "#;
 
+#[cfg(windows)]
+const WINDOW_CHROME_SCRIPT: &str = r#"
+(function () {
+  if (window.__icloudWinChrome) return;
+  window.__icloudWinChrome = true;
+
+  var STYLE_ID = 'icloud-win-chrome-style';
+  var ROOT_ID = 'icloud-win-chrome';
+  var css = [
+    /* Collapse Apple's own top chrome — it leaves a dead gap under our bar */
+    '.cloudos-toolbar-view,header.cloudos-toolbar.app,header.cloudos-toolbar,',
+    '.cw-toolbar,.toolbar-view,[class*="cloudos-toolbar"]{',
+    'display:none!important;height:0!important;min-height:0!important;',
+    'margin:0!important;padding:0!important;overflow:hidden!important;border:0!important;',
+    '}',
+    'html{--icloud-win-chrome-h:28px;}',
+    'body{padding-top:var(--icloud-win-chrome-h)!important;box-sizing:border-box;}',
+    '#' + ROOT_ID + '{',
+    'position:fixed;top:0;left:0;right:0;height:var(--icloud-win-chrome-h);z-index:2147483646;',
+    'display:flex;align-items:stretch;justify-content:flex-end;',
+    'box-sizing:border-box;pointer-events:none;',
+    '-webkit-app-region:drag;app-region:drag;',
+    'background:#121212;color:#b3b3b3;',
+    'border-bottom:1px solid rgba(255,255,255,0.08);',
+    'font-family:"Segoe UI",system-ui,sans-serif;',
+    '}',
+    '@media (prefers-color-scheme: light){',
+    '#' + ROOT_ID + '{background:#f5f5f7;color:#6e6e73;',
+    'border-bottom-color:rgba(0,0,0,0.08);}',
+    '}',
+    '#' + ROOT_ID + ' .icloud-win-chrome-btn{',
+    'pointer-events:auto;-webkit-app-region:no-drag;app-region:no-drag;',
+    'width:46px;border:0;background:transparent;color:inherit;cursor:default;',
+    'display:inline-flex;align-items:center;justify-content:center;padding:0;',
+    '}',
+    '#' + ROOT_ID + ' .icloud-win-chrome-btn:hover{',
+    'background:rgba(255,255,255,0.08);color:#fff;',
+    '}',
+    '@media (prefers-color-scheme: light){',
+    '#' + ROOT_ID + ' .icloud-win-chrome-btn:hover{',
+    'background:rgba(0,0,0,0.06);color:#1d1d1f;}',
+    '}',
+    '#' + ROOT_ID + ' .icloud-win-chrome-btn--close:hover{',
+    'background:#e5484d;color:#fff;',
+    '}',
+    '#' + ROOT_ID + ' svg{display:block;pointer-events:none;width:10px;height:10px;}'
+  ].join('');
+
+  function ensureStyle() {
+    var s = document.getElementById(STYLE_ID);
+    if (!s) {
+      s = document.createElement('style');
+      s.id = STYLE_ID;
+      (document.head || document.documentElement).appendChild(s);
+    }
+    s.textContent = css;
+  }
+
+  function stripAppleToolbar(root) {
+    root = root || document;
+    var selectors = [
+      '.cloudos-toolbar-view',
+      'header.cloudos-toolbar.app',
+      'header.cloudos-toolbar',
+      '.cw-toolbar',
+      '.toolbar-view'
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      root.querySelectorAll?.(selectors[i])?.forEach(function (el) {
+        el.remove();
+      });
+    }
+  }
+
+  function action(name) {
+    try {
+      var a = document.createElement('a');
+      a.href = 'icloud-chrome://' + name;
+      a.style.display = 'none';
+      document.documentElement.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (_) {}
+  }
+
+  function ensureChrome() {
+    ensureStyle();
+    stripAppleToolbar();
+    var root = document.getElementById(ROOT_ID);
+    if (root) return;
+    root = document.createElement('div');
+    root.id = ROOT_ID;
+    root.setAttribute('role', 'banner');
+    root.setAttribute('aria-label', 'Window');
+    root.innerHTML = [
+      '<button type="button" class="icloud-win-chrome-btn" data-action="minimize" title="Minimize" aria-label="Minimize">',
+      '<svg viewBox="0 0 10 10"><path fill="currentColor" d="M1 5h8v1H1z"/></svg></button>',
+      '<button type="button" class="icloud-win-chrome-btn" data-action="maximize" title="Maximize" aria-label="Maximize">',
+      '<svg viewBox="0 0 10 10"><path fill="currentColor" d="M1.5 1.5h7v7h-7zm1 1v5h5v-5z"/></svg></button>',
+      '<button type="button" class="icloud-win-chrome-btn icloud-win-chrome-btn--close" data-action="close" title="Close" aria-label="Close">',
+      '<svg viewBox="0 0 10 10"><path fill="currentColor" d="M1.2 2.1 2.1 1.2 5 4.1 7.9 1.2 8.8 2.1 5.9 5l2.9 2.9-.9.9L5 5.9 2.1 8.8l-.9-.9L4.1 5z"/></svg></button>'
+    ].join('');
+    root.addEventListener('click', function (e) {
+      var btn = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      action(btn.getAttribute('data-action'));
+    }, true);
+    (document.body || document.documentElement).appendChild(root);
+  }
+
+  function boot() {
+    ensureChrome();
+    if (!window.__icloudWinChromeObserver) {
+      var scheduled = false;
+      window.__icloudWinChromeObserver = new MutationObserver(function () {
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(function () {
+          scheduled = false;
+          ensureChrome();
+        });
+      });
+      window.__icloudWinChromeObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+      });
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();
+"#;
+
+const CHROME_SCHEME: &str = "icloud-chrome";
+
+fn chrome_action(url: &Url) -> Option<&str> {
+    if url.scheme() != CHROME_SCHEME {
+        return None;
+    }
+    let action = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| url.path().trim_matches('/'));
+    match action {
+        "minimize" | "maximize" | "close" => Some(action),
+        _ => None,
+    }
+}
+
+fn handle_chrome_action(app: &AppHandle, action: &str) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return;
+    };
+    match action {
+        "minimize" => {
+            let _ = window.minimize();
+        }
+        "maximize" => {
+            let maximized = window.is_maximized().unwrap_or(false);
+            if maximized {
+                let _ = window.unmaximize();
+            } else {
+                let _ = window.maximize();
+            }
+        }
+        "close" => {
+            let _ = window.close();
+        }
+        _ => {}
+    }
+}
+
+fn force_full_opacity(app: &AppHandle) {
+    if let Some(state) = app.try_state::<TrayBaseState>() {
+        let mut settings = state.settings.lock();
+        if (settings.opacity - 1.0).abs() > f64::EPSILON {
+            settings.opacity = 1.0;
+            let _ = save_settings(&state.settings_path, &settings);
+        }
+    }
+    apply_opacity(app, 1.0);
+}
+
 /// Product config for an iCloud / Apple web wrapper.
 #[derive(Debug, Clone, Copy)]
 pub struct IcloudAppConfig {
     pub app_name: &'static str,
     pub url: &'static str,
+    /// Unused — Apple's cloudos toolbar is always stripped.
     pub remove_toolbar: bool,
 }
 
@@ -257,10 +449,10 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
     let app_url = parse_app_url(config.url);
     let blank_url = Url::parse("about:blank").expect("about:blank");
     let app_for_nav = app.clone();
+    let app_for_chrome = app.clone();
     let app_for_open = app.clone();
     let app_for_download = app.clone();
     let nav_target = app_url.clone();
-    let remove_toolbar = config.remove_toolbar;
     let app_name = config.app_name;
 
     let mut builder =
@@ -271,20 +463,28 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
             .visible(false)
             .user_agent(SAFARI_UA)
             .data_directory(webview_data)
-            .initialization_script_for_all_frames(FONT_FIX_SCRIPT);
+            .initialization_script_for_all_frames(FONT_FIX_SCRIPT)
+            .initialization_script_for_all_frames(TOOLBAR_REMOVE_SCRIPT);
 
-    if remove_toolbar {
-        builder = builder.initialization_script_for_all_frames(TOOLBAR_REMOVE_SCRIPT);
+    #[cfg(windows)]
+    {
+        builder = builder.initialization_script(WINDOW_CHROME_SCRIPT);
     }
 
-    builder
+    let window = builder
         .on_page_load(move |window, _payload| {
             let _ = window.eval(FONT_FIX_SCRIPT);
-            if remove_toolbar {
-                let _ = window.eval(TOOLBAR_REMOVE_SCRIPT);
+            let _ = window.eval(TOOLBAR_REMOVE_SCRIPT);
+            #[cfg(windows)]
+            {
+                let _ = window.eval(WINDOW_CHROME_SCRIPT);
             }
         })
         .on_navigation(move |url| {
+            if let Some(action) = chrome_action(url) {
+                handle_chrome_action(&app_for_chrome, action);
+                return false;
+            }
             if is_icloud_home_redirect(url, &nav_target) {
                 let handle = app_for_nav.clone();
                 let target = nav_target.clone();
@@ -316,7 +516,20 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
             }
             NewWindowResponse::Deny
         })
-        .build()
+        .build()?;
+
+    #[cfg(windows)]
+    {
+        let _ = window.set_decorations(false);
+        let _ = window.set_shadow(true);
+        // Frameless WebView2 can show the desktop through page chrome unless the
+        // controller has an opaque default background.
+        let _ = window.set_background_color(Some(
+            tauri::window::Color::from((255u8, 255u8, 255u8, 255u8)),
+        ));
+    }
+
+    Ok(window)
 }
 
 /// Run a tray-first iCloud/Apple web wrapper.
@@ -338,6 +551,7 @@ pub fn run(config: IcloudAppConfig, context: Context) {
                     show_hide: false,
                     show_always_on_top: false,
                     tray_on_click: TrayClickAction::Toggle,
+                    defaults: HashMap::from([("opacity".into(), json!(1.0))]),
                     extra_tray_items: vec![TrayExtraItem {
                         id: "refresh".into(),
                         label: "Refresh".into(),
@@ -356,6 +570,9 @@ pub fn run(config: IcloudAppConfig, context: Context) {
             )?;
 
             apply_window_settings(&handle);
+            // Web wrappers must stay fully opaque. tray-base defaults to 0.94, and
+            // layered opacity + frameless makes Apple UIs look transparent.
+            force_full_opacity(&handle);
 
             let quit_app = handle.clone();
             set_on_before_quit(&handle, move || {

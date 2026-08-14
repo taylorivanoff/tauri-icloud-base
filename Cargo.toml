@@ -2,7 +2,7 @@
 name = "tauri-icloud-base"
 version = "0.1.0"
 edition = "2021"
-description = "Shared Tauri 2 shell for iCloud/Apple web wrappers (cookies, Safari UA, tray)."
+description = "Shared Tauri 2 shell for iCloud/Apple web wrappers (cookies, Safari UA, tray, Windows chrome)."
 authors = ["Taylor Ivanoff"]
 license = "MIT"
 repository = "https://github.com/taylorivanoff/tauri-icloud-base"
