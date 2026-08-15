@@ -10,6 +10,7 @@ use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 use cookie::SameSite;
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri_tray_base::Quitting;
 use time::{Duration, OffsetDateTime};
 
 const SESSION_COOKIE_TTL_SECS: i64 = 180 * 24 * 60 * 60;
@@ -232,11 +233,49 @@ pub fn save_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
     Ok(())
 }
 
+/// Wipe Apple session cookies + persisted cookies.json (and browsing data).
+/// Call from a non-WebView2 UI thread on Windows.
+pub fn clear_session(app: &AppHandle, window: &WebviewWindow) -> Result<(), String> {
+    APPLYING.store(true, Ordering::SeqCst);
+    let result = (|| {
+        if let Ok(all) = window.cookies() {
+            for cookie in all {
+                let domain = cookie.domain().unwrap_or("");
+                if is_apple_family_domain(domain) {
+                    if let Err(e) = window.delete_cookie(cookie) {
+                        eprintln!("[cookies] delete failed: {e}");
+                    }
+                }
+            }
+        }
+        if let Err(e) = window.clear_all_browsing_data() {
+            eprintln!("[cookies] clear browsing data: {e}");
+        }
+
+        let path = cookie_file_path(app)?;
+        ensure_parent(&path)?;
+        fs::write(&path, "[]").map_err(|e| format!("write cookies.json: {e}"))?;
+        if let Ok(mut fp) = LAST_FINGERPRINT.lock() {
+            *fp = String::new();
+        }
+        Ok(())
+    })();
+    APPLYING.store(false, Ordering::SeqCst);
+    result
+}
+
+fn is_quitting(app: &AppHandle) -> bool {
+    app.try_state::<Quitting>().map(|q| q.get()).unwrap_or(false)
+}
+
 /// Periodic poll so we catch auth cookies without a cookie-changed event.
 pub fn start_cookie_poller(app: AppHandle, window: WebviewWindow) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
+            if is_quitting(&app) {
+                break;
+            }
             if APPLYING.load(Ordering::SeqCst) {
                 continue;
             }

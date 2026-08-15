@@ -15,9 +15,10 @@ use tauri::{
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_tray_base::{
-    apply_opacity, apply_window_settings, install_state, on_window_event, save_settings,
-    set_on_before_quit, setup_tray, with_common_plugins, TrayBaseOptions, TrayBaseState,
-    TrayClickAction, TrayExtraItem, TraySetupOptions, MAIN_WINDOW_LABEL,
+    apply_opacity, apply_window_settings, enable_frameless_chrome, hide_main, install_state,
+    on_window_event, save_settings, set_on_before_quit, setup_tray, show_main, with_common_plugins,
+    TrayBaseOptions, TrayBaseState, TrayClickAction, TrayExtraItem, TraySetupOptions,
+    MAIN_WINDOW_LABEL,
 };
 use url::Url;
 
@@ -101,6 +102,9 @@ const TOOLBAR_REMOVE_SCRIPT: &str = r#"
 #[cfg(windows)]
 const WINDOW_CHROME_SCRIPT: &str = r#"
 (function () {
+  // WebView2 always runs init scripts in subframes; never paint window chrome
+  // inside Apple's auth iframe (shows min/max/close inside the sign-in sheet).
+  if (window !== window.top) return;
   if (window.__icloudWinChrome) return;
   window.__icloudWinChrome = true;
 
@@ -123,19 +127,27 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     'position:fixed;top:0;left:0;right:0;height:var(--icloud-win-chrome-h);z-index:2147483646;',
     'display:flex;align-items:stretch;justify-content:flex-end;',
     'box-sizing:border-box;pointer-events:none;',
-    '-webkit-app-region:drag;app-region:drag;',
     'background:#121212;color:#b3b3b3;',
     'border-bottom:1px solid rgba(255,255,255,0.08);',
     'font-family:"Segoe UI",system-ui,sans-serif;',
+    '}',
+    /* Drag only on the filler — nesting no-drag buttons under drag is flaky on WebView2 */
+    '#' + ROOT_ID + ' .icloud-win-chrome-drag{',
+    'flex:1 1 auto;min-width:0;pointer-events:auto;',
+    '-webkit-app-region:drag;app-region:drag;',
+    '}',
+    '#' + ROOT_ID + ' .icloud-win-chrome-controls{',
+    'display:flex;align-items:stretch;flex:0 0 auto;height:100%;',
+    'pointer-events:auto;-webkit-app-region:no-drag;app-region:no-drag;',
     '}',
     '@media (prefers-color-scheme: light){',
     '#' + ROOT_ID + '{background:#f5f5f7;color:#6e6e73;',
     'border-bottom-color:rgba(0,0,0,0.08);}',
     '}',
     '#' + ROOT_ID + ' .icloud-win-chrome-btn{',
-    'pointer-events:auto;-webkit-app-region:no-drag;app-region:no-drag;',
     'width:46px;border:0;background:transparent;color:inherit;cursor:default;',
     'display:inline-flex;align-items:center;justify-content:center;padding:0;',
+    '-webkit-app-region:no-drag;app-region:no-drag;',
     '}',
     '#' + ROOT_ID + ' .icloud-win-chrome-btn:hover{',
     'background:rgba(255,255,255,0.08);color:#fff;',
@@ -176,14 +188,20 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     }
   }
 
+  // Same-origin path — WebView2 always delivers NavigationStarting; we cancel it.
+  // (Custom schemes are dropped; fake downloads triggered "download failed" toasts.)
+  var CHROME_PATH = '/__icloud_win_chrome__/';
+  var lastActionAt = 0;
   function action(name) {
+    var now = Date.now();
+    if (now - lastActionAt < 250) return;
+    lastActionAt = now;
     try {
-      var a = document.createElement('a');
-      a.href = 'icloud-chrome://' + name;
-      a.style.display = 'none';
-      document.documentElement.appendChild(a);
-      a.click();
-      a.remove();
+      var u = new URL(window.location.href);
+      u.pathname = CHROME_PATH + name;
+      u.search = '';
+      u.hash = '';
+      window.location.assign(u.href);
     } catch (_) {}
   }
 
@@ -197,20 +215,27 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     root.setAttribute('role', 'banner');
     root.setAttribute('aria-label', 'Window');
     root.innerHTML = [
+      '<div class="icloud-win-chrome-drag" aria-hidden="true"></div>',
+      '<div class="icloud-win-chrome-controls">',
       '<button type="button" class="icloud-win-chrome-btn" data-action="minimize" title="Minimize" aria-label="Minimize">',
       '<svg viewBox="0 0 10 10"><path fill="currentColor" d="M1 5h8v1H1z"/></svg></button>',
       '<button type="button" class="icloud-win-chrome-btn" data-action="maximize" title="Maximize" aria-label="Maximize">',
       '<svg viewBox="0 0 10 10"><path fill="currentColor" d="M1.5 1.5h7v7h-7zm1 1v5h5v-5z"/></svg></button>',
       '<button type="button" class="icloud-win-chrome-btn icloud-win-chrome-btn--close" data-action="close" title="Close" aria-label="Close">',
-      '<svg viewBox="0 0 10 10"><path fill="currentColor" d="M1.2 2.1 2.1 1.2 5 4.1 7.9 1.2 8.8 2.1 5.9 5l2.9 2.9-.9.9L5 5.9 2.1 8.8l-.9-.9L4.1 5z"/></svg></button>'
+      '<svg viewBox="0 0 10 10"><path fill="currentColor" d="M1.2 2.1 2.1 1.2 5 4.1 7.9 1.2 8.8 2.1 5.9 5l2.9 2.9-.9.9L5 5.9 2.1 8.8l-.9-.9L4.1 5z"/></svg></button>',
+      '</div>'
     ].join('');
-    root.addEventListener('click', function (e) {
+    // pointerdown fires before WebView2 drag-region hit-testing can swallow click
+    function onControl(e) {
+      if (e.button != null && e.button !== 0) return;
       var btn = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
-      if (!btn) return;
+      if (!btn || !root.contains(btn)) return;
       e.preventDefault();
       e.stopPropagation();
       action(btn.getAttribute('data-action'));
-    }, true);
+    }
+    root.addEventListener('pointerdown', onControl, true);
+    root.addEventListener('click', onControl, true);
     (document.body || document.documentElement).appendChild(root);
   }
 
@@ -241,43 +266,50 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
 })();
 "#;
 
-const CHROME_SCHEME: &str = "icloud-chrome";
+const CHROME_PATH_MARKER: &str = "/__icloud_win_chrome__/";
 
-fn chrome_action(url: &Url) -> Option<&str> {
-    if url.scheme() != CHROME_SCHEME {
-        return None;
-    }
-    let action = url
-        .host_str()
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| url.path().trim_matches('/'));
-    match action {
-        "minimize" | "maximize" | "close" => Some(action),
+fn chrome_action_name(name: &str) -> Option<&str> {
+    match name {
+        "minimize" | "maximize" | "close" => Some(name),
         _ => None,
     }
 }
 
-fn handle_chrome_action(app: &AppHandle, action: &str) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
-        return;
-    };
-    match action {
-        "minimize" => {
-            let _ = window.minimize();
-        }
-        "maximize" => {
-            let maximized = window.is_maximized().unwrap_or(false);
-            if maximized {
-                let _ = window.unmaximize();
-            } else {
-                let _ = window.maximize();
-            }
-        }
-        "close" => {
-            let _ = window.close();
-        }
-        _ => {}
+fn chrome_action(url: &Url) -> Option<&str> {
+    if let Some(idx) = url.path().find(CHROME_PATH_MARKER) {
+        let rest = &url.path()[idx + CHROME_PATH_MARKER.len()..];
+        let action = rest.split('/').next().unwrap_or("").trim_matches('/');
+        return chrome_action_name(action);
     }
+    None
+}
+
+fn handle_chrome_action(app: &AppHandle, action: &str) {
+    if action == "close" {
+        hide_main(app);
+        return;
+    }
+    let handle = app.clone();
+    let action = action.to_string();
+    let _ = app.run_on_main_thread(move || {
+        let Some(window) = handle.get_webview_window(MAIN_WINDOW_LABEL) else {
+            return;
+        };
+        match action.as_str() {
+            "minimize" => {
+                let _ = window.minimize();
+            }
+            "maximize" => {
+                let maximized = window.is_maximized().unwrap_or(false);
+                if maximized {
+                    let _ = window.unmaximize();
+                } else {
+                    let _ = window.maximize();
+                }
+            }
+            _ => {}
+        }
+    });
 }
 
 fn force_full_opacity(app: &AppHandle) {
@@ -442,6 +474,22 @@ fn refresh_page(app: &AppHandle, url: Url) {
     }
 }
 
+fn sign_out(app: AppHandle, url: Url) {
+    std::thread::spawn(move || {
+        let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+            return;
+        };
+        if let Err(e) = cookies::clear_session(&app, &window) {
+            eprintln!("[cookies] sign out: {e}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        if let Err(e) = window.navigate(url) {
+            eprintln!("[cookies] navigate after sign out: {e}");
+        }
+        show_main(&app);
+    });
+}
+
 fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<WebviewWindow> {
     let app_data = app
         .path()
@@ -454,6 +502,7 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
     let blank_url = Url::parse("about:blank").expect("about:blank");
     let app_for_nav = app.clone();
     let app_for_chrome = app.clone();
+    let app_for_chrome_nw = app.clone();
     let app_for_open = app.clone();
     let app_for_download = app.clone();
     let nav_target = app_url.clone();
@@ -470,9 +519,14 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
             .initialization_script_for_all_frames(FONT_FIX_SCRIPT)
             .initialization_script_for_all_frames(TOOLBAR_REMOVE_SCRIPT);
 
+    // Frameless before create — set_decorations(false) after build can lose to the
+    // initial Win32 frame, which stacks native caption buttons under our chrome.
     #[cfg(windows)]
     {
-        builder = builder.initialization_script(WINDOW_CHROME_SCRIPT);
+        builder = builder
+            .decorations(false)
+            .shadow(true)
+            .initialization_script(WINDOW_CHROME_SCRIPT);
     }
 
     let window = builder
@@ -514,6 +568,10 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
             _ => true,
         })
         .on_new_window(move |url, _features| {
+            if let Some(action) = chrome_action(&url) {
+                handle_chrome_action(&app_for_chrome_nw, action);
+                return NewWindowResponse::Deny;
+            }
             let href = url.as_str().to_string();
             if href != "about:blank#blocked" && !href.starts_with("about:blank") {
                 let _ = app_for_open.opener().open_url(href, None::<&str>);
@@ -524,6 +582,7 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
 
     #[cfg(windows)]
     {
+        // Belt-and-suspenders: opacity / FRAMECHANGED can revive the native frame.
         let _ = window.set_decorations(false);
         let _ = window.set_shadow(true);
         // Frameless WebView2 can show the desktop through page chrome unless the
@@ -556,10 +615,16 @@ pub fn run(config: IcloudAppConfig, context: Context) {
                     show_always_on_top: false,
                     tray_on_click: TrayClickAction::Toggle,
                     defaults: HashMap::from([("opacity".into(), json!(1.0))]),
-                    extra_tray_items: vec![TrayExtraItem {
-                        id: "refresh".into(),
-                        label: "Refresh".into(),
-                    }],
+                    extra_tray_items: vec![
+                        TrayExtraItem {
+                            id: "refresh".into(),
+                            label: "Refresh".into(),
+                        },
+                        TrayExtraItem {
+                            id: "sign-out".into(),
+                            label: "Sign Out".into(),
+                        },
+                    ],
                     ..Default::default()
                 },
             )?;
@@ -577,6 +642,8 @@ pub fn run(config: IcloudAppConfig, context: Context) {
             // Web wrappers must stay fully opaque. tray-base defaults to 0.94, and
             // layered opacity + frameless makes Apple UIs look transparent.
             force_full_opacity(&handle);
+            // Re-assert after opacity (SWP_FRAMECHANGED can restore native captions).
+            enable_frameless_chrome(&handle);
 
             let quit_app = handle.clone();
             set_on_before_quit(&handle, move || {
@@ -585,11 +652,13 @@ pub fn run(config: IcloudAppConfig, context: Context) {
 
             restore_session_then_navigate(handle.clone(), window, app_url.clone());
 
-            let refresh_handle = handle.clone();
-            let refresh_url = app_url.clone();
+            let action_handle = handle.clone();
+            let action_url = app_url.clone();
             handle.listen("tray:action", move |event| {
-                if event.payload().trim_matches('"') == "refresh" {
-                    refresh_page(&refresh_handle, refresh_url.clone());
+                match event.payload().trim_matches('"') {
+                    "refresh" => refresh_page(&action_handle, action_url.clone()),
+                    "sign-out" => sign_out(action_handle.clone(), action_url.clone()),
+                    _ => {}
                 }
             });
 
