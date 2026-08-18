@@ -1,6 +1,8 @@
 //! Shared Tauri shell for iCloud / Apple web wrappers.
 
 mod cookies;
+#[cfg(windows)]
+mod cookies_webview2;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -8,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::json;
-use tauri::webview::{DownloadEvent, NewWindowResponse};
+use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
 use tauri::{
     AppHandle, Context, Listener, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
@@ -440,10 +442,25 @@ fn persist_cookies(app: &AppHandle) {
     }
 }
 
+const RESTORE_RETRY_DELAYS_MS: [u64; 8] = [50, 100, 200, 400, 800, 1600, 3200, 5000];
+
+fn is_apple_family_url(url: &Url) -> bool {
+    url.host_str()
+        .map(cookies::is_apple_family_domain)
+        .unwrap_or(false)
+}
+
+fn is_apple_sign_in_url(url: &Url) -> bool {
+    matches!(
+        url.host_str(),
+        Some("idmsa.apple.com") | Some("appleid.apple.com") | Some("signin.apple.com")
+    )
+}
+
 fn restore_session_then_navigate(app: AppHandle, window: WebviewWindow, url: Url) {
     std::thread::spawn(move || {
         let mut restored = false;
-        for delay_ms in [50_u64, 100, 200, 400] {
+        for delay_ms in RESTORE_RETRY_DELAYS_MS {
             std::thread::sleep(Duration::from_millis(delay_ms));
             match cookies::load_persisted_cookies(&app, &window) {
                 Ok(true) => {
@@ -459,7 +476,7 @@ fn restore_session_then_navigate(app: AppHandle, window: WebviewWindow, url: Url
             }
         }
         if restored {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(200));
         }
         if let Err(e) = window.navigate(url) {
             eprintln!("[cookies] navigate after restore: {e}");
@@ -505,6 +522,8 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
     let app_for_chrome_nw = app.clone();
     let app_for_open = app.clone();
     let app_for_download = app.clone();
+    let app_for_cookies = app.clone();
+    let app_for_auth_window = app.clone();
     let nav_target = app_url.clone();
     let app_name = config.app_name;
 
@@ -530,12 +549,21 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
     }
 
     let window = builder
-        .on_page_load(move |window, _payload| {
+        .on_page_load(move |window, payload| {
             let _ = window.eval(FONT_FIX_SCRIPT);
             let _ = window.eval(TOOLBAR_REMOVE_SCRIPT);
             #[cfg(windows)]
             {
                 let _ = window.eval(WINDOW_CHROME_SCRIPT);
+            }
+            if payload.event() == PageLoadEvent::Finished && is_apple_family_url(payload.url()) {
+                let app = app_for_cookies.clone();
+                let win = window.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = cookies::save_persisted_cookies_if_authed(&app, &win) {
+                        eprintln!("[cookies] save on auth: {e}");
+                    }
+                });
             }
         })
         .on_navigation(move |url| {
@@ -547,12 +575,17 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
                 let handle = app_for_nav.clone();
                 let target = nav_target.clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    if let Some(w) = handle.get_webview_window(MAIN_WINDOW_LABEL) {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let Some(w) = handle.get_webview_window(MAIN_WINDOW_LABEL) else {
+                        return;
+                    };
+                    if cookies::webview_has_apple_auth(&w).unwrap_or(false) {
                         let _ = w.navigate(target);
                     }
                 });
-                return false;
+                // Never cancel `/` — Apple ID sign-in returns here. Cancelling it
+                // loops the user back to the Sign In button.
+                return true;
             }
             true
         })
@@ -570,6 +603,20 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
         .on_new_window(move |url, _features| {
             if let Some(action) = chrome_action(&url) {
                 handle_chrome_action(&app_for_chrome_nw, action);
+                return NewWindowResponse::Deny;
+            }
+            // Apple ID sign-in often window.open()s idmsa. Keep it in this webview
+            // instead of the system browser (which leaves the app stuck on Sign In).
+            if is_apple_family_url(&url) || is_apple_sign_in_url(&url) {
+                let handle = app_for_auth_window.clone();
+                let target = url.clone();
+                std::thread::spawn(move || {
+                    if let Some(w) = handle.get_webview_window(MAIN_WINDOW_LABEL) {
+                        if let Err(e) = w.navigate(target) {
+                            eprintln!("[cookies] navigate auth window: {e}");
+                        }
+                    }
+                });
                 return NewWindowResponse::Deny;
             }
             let href = url.as_str().to_string();
@@ -667,9 +714,12 @@ pub fn run(config: IcloudAppConfig, context: Context) {
         .on_window_event(|window, event| on_window_event(window, &event))
         .build(context)
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
+        .run(|app_handle, event| {
             if let RunEvent::ExitRequested { .. } = event {
-                // Cookies persist via before-quit; do not block the UI thread here.
+                let app = app_handle.clone();
+                let _ = std::thread::Builder::new()
+                    .name("exit-persist".into())
+                    .spawn(move || persist_cookies(&app));
             }
         });
 }

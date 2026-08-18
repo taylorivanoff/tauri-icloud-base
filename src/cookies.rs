@@ -6,23 +6,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use cookie::SameSite;
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use tauri_tray_base::Quitting;
 use time::{Duration, OffsetDateTime};
 
+#[cfg(windows)]
+use crate::cookies_webview2;
+
 const SESSION_COOKIE_TTL_SECS: i64 = 180 * 24 * 60 * 60;
-/// After restore, ignore logged-out snapshots so a login page cannot wipe cookies.json.
-const STARTUP_GUARD_SECS: u64 = 20;
 
 static APPLYING: AtomicBool = AtomicBool::new(false);
 static LAST_FINGERPRINT: Mutex<String> = Mutex::new(String::new());
-static STARTUP_GUARD_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredCookie {
+    #[serde(default)]
+    pub url: String,
     pub name: String,
     pub value: String,
     pub domain: String,
@@ -63,37 +65,44 @@ fn ensure_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn begin_startup_guard() {
-    if let Ok(mut until) = STARTUP_GUARD_UNTIL.lock() {
-        *until = Some(Instant::now() + StdDuration::from_secs(STARTUP_GUARD_SECS));
+fn is_apple_auth_cookie_name(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    n.starts_with("X-APPLE-WEBAUTH")
+        || n.starts_with("X-APPLE-DS-WEB-SESSION")
+        || matches!(n.as_str(), "MYACINFO" | "AASP" | "ACN01" | "DES" | "DSID")
+}
+
+/// Electron keeps Chromium's leading `.` on apex domain cookies. Tauri strips it.
+fn persist_domain(domain: &str) -> String {
+    let trimmed = domain.trim();
+    if trimmed.starts_with('.') {
+        return trimmed.to_ascii_lowercase();
+    }
+    let d = trimmed.to_ascii_lowercase();
+    if d == "icloud.com" || d == "apple.com" {
+        format!(".{d}")
+    } else {
+        d
     }
 }
 
-fn in_startup_guard() -> bool {
-    STARTUP_GUARD_UNTIL
-        .lock()
-        .ok()
-        .and_then(|g| *g)
-        .map(|until| Instant::now() < until)
-        .unwrap_or(false)
+fn cookie_url(domain: &str, path: &str) -> String {
+    let host = domain.trim_start_matches('.');
+    let path = if path.is_empty() { "/" } else { path };
+    format!("https://{host}{path}")
 }
 
-fn has_apple_auth(cookies: &[StoredCookie]) -> bool {
-    cookies.iter().any(|c| {
-        let n = c.name.to_ascii_uppercase();
-        n.starts_with("X-APPLE-WEBAUTH") || n == "MYACINFO"
-    })
+pub fn has_apple_auth(cookies: &[StoredCookie]) -> bool {
+    cookies.iter().any(|c| is_apple_auth_cookie_name(&c.name))
 }
 
-fn should_skip_startup_clobber(path: &Path, cookies: &[StoredCookie]) -> bool {
-    if !in_startup_guard() {
-        return false;
-    }
+/// Never overwrite on-disk auth cookies with a logged-out webview snapshot.
+fn should_skip_auth_clobber(path: &Path, cookies: &[StoredCookie]) -> bool {
     let Some(existing) = read_cookie_file(path) else {
         return false;
     };
     if cookies.is_empty() && !existing.is_empty() {
-        return true;
+        return has_apple_auth(&existing);
     }
     has_apple_auth(&existing) && !has_apple_auth(cookies)
 }
@@ -116,26 +125,35 @@ fn same_site_str(cookie: &Cookie<'_>) -> String {
 }
 
 fn serialize_cookie(cookie: &Cookie<'_>) -> Option<StoredCookie> {
-    let domain = cookie.domain()?.to_string();
-    if !is_apple_family_domain(&domain) {
+    let raw_domain = cookie.domain()?.to_string();
+    if !is_apple_family_domain(&raw_domain) {
         return None;
     }
-
+    let domain = persist_domain(&raw_domain);
+    let path = cookie.path().unwrap_or("/").to_string();
     let expiration_date = cookie
         .expires_datetime()
         .map(|dt| dt.unix_timestamp())
         .unwrap_or_else(|| now_unix() + SESSION_COOKIE_TTL_SECS);
 
     Some(StoredCookie {
+        url: cookie_url(&domain, &path),
         name: cookie.name().to_string(),
         value: cookie.value().to_string(),
         domain,
-        path: cookie.path().unwrap_or("/").to_string(),
+        path,
         secure: cookie.secure().unwrap_or(true),
         http_only: cookie.http_only().unwrap_or(false),
         expiration_date,
         same_site: same_site_str(cookie),
     })
+}
+
+fn snapshot_apple_cookies(window: &WebviewWindow) -> Result<Vec<StoredCookie>, String> {
+    let all = window
+        .cookies()
+        .map_err(|e| format!("cookies(): {e}"))?;
+    Ok(all.iter().filter_map(serialize_cookie).collect())
 }
 
 fn to_tauri_cookie(stored: &StoredCookie) -> Cookie<'static> {
@@ -158,6 +176,26 @@ fn to_tauri_cookie(stored: &StoredCookie) -> Cookie<'static> {
         .build()
 }
 
+fn apply_stored_cookie(window: &WebviewWindow, stored: &StoredCookie) -> bool {
+    #[cfg(windows)]
+    {
+        match cookies_webview2::set_stored_cookie(window, stored) {
+            Ok(()) => return true,
+            Err(e) => eprintln!(
+                "[cookies] webview2 set failed {}, falling back: {e}",
+                stored.name
+            ),
+        }
+    }
+    match window.set_cookie(to_tauri_cookie(stored)) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[cookies] set failed {}: {e}", stored.name);
+            false
+        }
+    }
+}
+
 fn read_cookie_file(path: &Path) -> Option<Vec<StoredCookie>> {
     let raw = fs::read_to_string(path).ok()?;
     let cookies: Vec<StoredCookie> = serde_json::from_str(&raw).ok()?;
@@ -168,6 +206,12 @@ fn read_cookie_file(path: &Path) -> Option<Vec<StoredCookie>> {
     }
 }
 
+/// True when the webview cookie jar contains Apple auth markers.
+pub fn webview_has_apple_auth(window: &WebviewWindow) -> Result<bool, String> {
+    let cookies = snapshot_apple_cookies(window)?;
+    Ok(has_apple_auth(&cookies))
+}
+
 /// Restore persisted Apple cookies into the webview. Call from a non-WebView2 UI thread.
 pub fn load_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result<bool, String> {
     let path = cookie_file_path(app)?;
@@ -175,7 +219,6 @@ pub fn load_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
         return Ok(false);
     };
 
-    begin_startup_guard();
     APPLYING.store(true, Ordering::SeqCst);
     let result = (|| {
         let mut applied = 0usize;
@@ -183,10 +226,8 @@ pub fn load_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
             if stored.name.is_empty() || stored.domain.is_empty() {
                 continue;
             }
-            let cookie = to_tauri_cookie(stored);
-            match window.set_cookie(cookie) {
-                Ok(()) => applied += 1,
-                Err(e) => eprintln!("[cookies] set failed {}: {e}", stored.name),
+            if apply_stored_cookie(window, stored) {
+                applied += 1;
             }
         }
         if let Ok(mut fp) = LAST_FINGERPRINT.lock() {
@@ -195,6 +236,7 @@ pub fn load_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
         if applied == 0 {
             return Err("no cookies applied".into());
         }
+        eprintln!("[cookies] applied {applied} cookies from disk");
         Ok(true)
     })();
     APPLYING.store(false, Ordering::SeqCst);
@@ -207,15 +249,12 @@ pub fn save_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
         return Ok(());
     }
 
-    let all = window
-        .cookies()
-        .map_err(|e| format!("cookies(): {e}"))?;
-
-    let cookies: Vec<StoredCookie> = all.iter().filter_map(serialize_cookie).collect();
+    let cookies = snapshot_apple_cookies(window)?;
     let path = cookie_file_path(app)?;
-    if should_skip_startup_clobber(&path, &cookies) {
+    if should_skip_auth_clobber(&path, &cookies) {
         return Ok(());
     }
+
     let next = fingerprint(&cookies);
     {
         let mut fp = LAST_FINGERPRINT.lock().map_err(|e| e.to_string())?;
@@ -231,6 +270,14 @@ pub fn save_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
     fs::write(&tmp, json).map_err(|e| format!("write tmp: {e}"))?;
     fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
     Ok(())
+}
+
+/// Persist cookies immediately when the webview shows an authenticated session.
+pub fn save_persisted_cookies_if_authed(app: &AppHandle, window: &WebviewWindow) -> Result<(), String> {
+    if !webview_has_apple_auth(window)? {
+        return Ok(());
+    }
+    save_persisted_cookies(app, window)
 }
 
 /// Wipe Apple session cookies + persisted cookies.json (and browsing data).
@@ -284,4 +331,80 @@ pub fn start_cookie_poller(app: AppHandle, window: WebviewWindow) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_auth_cookie() -> StoredCookie {
+        StoredCookie {
+            url: "https://icloud.com/".into(),
+            name: "X-APPLE-WEBAUTH-TOKEN".into(),
+            value: "secret".into(),
+            domain: ".icloud.com".into(),
+            path: "/".into(),
+            secure: true,
+            http_only: true,
+            expiration_date: 999_999_999,
+            same_site: "lax".into(),
+        }
+    }
+
+    fn write_cookie_file(path: &Path, cookies: &[StoredCookie]) {
+        let parent = path.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        let json = serde_json::to_string_pretty(cookies).unwrap();
+        fs::write(path, json).unwrap();
+    }
+
+    #[test]
+    fn has_apple_auth_recognizes_common_markers() {
+        assert!(has_apple_auth(&[sample_auth_cookie()]));
+        assert!(has_apple_auth(&[StoredCookie {
+            name: "aasp".into(),
+            ..sample_auth_cookie()
+        }]));
+        assert!(!has_apple_auth(&[StoredCookie {
+            name: "pref".into(),
+            ..sample_auth_cookie()
+        }]));
+    }
+
+    #[test]
+    fn skip_auth_clobber_protects_saved_session() {
+        let dir = std::env::temp_dir().join(format!("icloud-cookies-test-{}", std::process::id()));
+        let path = dir.join("cookies.json");
+        write_cookie_file(&path, &[sample_auth_cookie()]);
+
+        assert!(should_skip_auth_clobber(&path, &[]));
+        assert!(should_skip_auth_clobber(
+            &path,
+            &[StoredCookie {
+                name: "pref".into(),
+                ..sample_auth_cookie()
+            }]
+        ));
+        assert!(!should_skip_auth_clobber(&path, &[sample_auth_cookie()]));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persist_domain_adds_leading_dot_for_apex_only() {
+        assert_eq!(persist_domain("icloud.com"), ".icloud.com");
+        assert_eq!(persist_domain(".icloud.com"), ".icloud.com");
+        assert_eq!(persist_domain("www.icloud.com"), "www.icloud.com");
+        assert_eq!(persist_domain("idmsa.apple.com"), "idmsa.apple.com");
+        assert_eq!(persist_domain("apple.com"), ".apple.com");
+    }
+
+    #[test]
+    fn cookie_url_matches_electron() {
+        assert_eq!(cookie_url(".icloud.com", "/"), "https://icloud.com/");
+        assert_eq!(
+            cookie_url("idmsa.apple.com", "/appleauth/auth"),
+            "https://idmsa.apple.com/appleauth/auth"
+        );
+    }
 }
