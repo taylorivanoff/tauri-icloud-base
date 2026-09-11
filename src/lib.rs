@@ -7,6 +7,7 @@ mod cookies_webview2;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -19,7 +20,7 @@ use tauri_plugin_opener::OpenerExt;
 use tauri_tray_base::{
     apply_opacity, apply_window_settings, enable_frameless_chrome, hide_main, install_state,
     on_window_event, save_settings, set_on_before_quit, setup_tray, show_main, with_common_plugins,
-    TrayBaseOptions, TrayBaseState, TrayClickAction, TrayExtraItem, TraySetupOptions,
+    Quitting, TrayBaseOptions, TrayBaseState, TrayClickAction, TrayExtraItem, TraySetupOptions,
     MAIN_WINDOW_LABEL,
 };
 use url::Url;
@@ -442,7 +443,8 @@ fn persist_cookies(app: &AppHandle) {
     }
 }
 
-const RESTORE_RETRY_DELAYS_MS: [u64; 8] = [50, 100, 200, 400, 800, 1600, 3200, 5000];
+const RESTORE_RETRY_DELAYS_MS: [u64; 10] =
+    [50, 100, 200, 400, 800, 1600, 3200, 5000, 8000, 12000];
 
 fn is_apple_family_url(url: &Url) -> bool {
     url.host_str()
@@ -476,7 +478,9 @@ fn restore_session_then_navigate(app: AppHandle, window: WebviewWindow, url: Url
             }
         }
         if restored {
-            std::thread::sleep(Duration::from_millis(200));
+            // Give CookieManager a beat before the first real navigation so
+            // www.icloud.com receives the restored jar.
+            std::thread::sleep(Duration::from_millis(300));
         }
         if let Err(e) = window.navigate(url) {
             eprintln!("[cookies] navigate after restore: {e}");
@@ -715,11 +719,31 @@ pub fn run(config: IcloudAppConfig, context: Context) {
         .build(context)
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            if let RunEvent::ExitRequested { .. } = event {
+            // Windows restart/shutdown sends ExitRequested without the tray quit
+            // path. Prevent exit, flush cookies.json, then exit once.
+            if let RunEvent::ExitRequested { api, .. } = &event {
+                let already_quitting = app_handle
+                    .try_state::<Quitting>()
+                    .map(|q| q.get())
+                    .unwrap_or(false);
+                if already_quitting {
+                    return;
+                }
+                static EXIT_FLUSH_STARTED: AtomicBool = AtomicBool::new(false);
+                if EXIT_FLUSH_STARTED.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                api.prevent_exit();
                 let app = app_handle.clone();
                 let _ = std::thread::Builder::new()
                     .name("exit-persist".into())
-                    .spawn(move || persist_cookies(&app));
+                    .spawn(move || {
+                        if let Some(q) = app.try_state::<Quitting>() {
+                            q.set(true);
+                        }
+                        persist_cookies(&app);
+                        app.exit(0);
+                    });
             }
         });
 }

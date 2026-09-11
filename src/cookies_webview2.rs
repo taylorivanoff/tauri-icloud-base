@@ -13,23 +13,27 @@ use windows::core::{Interface, HSTRING};
 
 use crate::cookies::StoredCookie;
 
-pub fn set_stored_cookie(window: &WebviewWindow, stored: &StoredCookie) -> Result<(), String> {
-    let stored = stored.clone();
+/// Apply all cookies in a single `with_webview` hop (cold-start safe).
+pub fn set_stored_cookies(
+    window: &WebviewWindow,
+    cookies: &[StoredCookie],
+) -> Result<usize, String> {
+    let cookies = cookies.to_vec();
     let (tx, rx) = mpsc::channel();
     window
         .with_webview(move |webview| {
-            let result = unsafe { set_cookie_on_manager(&webview, &stored) };
+            let result = unsafe { set_cookies_on_manager(&webview, &cookies) };
             let _ = tx.send(result);
         })
         .map_err(|e| format!("with_webview: {e}"))?;
-    rx.recv_timeout(Duration::from_secs(5))
+    rx.recv_timeout(Duration::from_secs(20))
         .map_err(|e| format!("cookie set wait: {e}"))?
 }
 
-unsafe fn set_cookie_on_manager(
+unsafe fn set_cookies_on_manager(
     webview: &tauri::webview::PlatformWebview,
-    stored: &StoredCookie,
-) -> Result<(), String> {
+    cookies: &[StoredCookie],
+) -> Result<usize, String> {
     let core = webview
         .controller()
         .CoreWebView2()
@@ -41,6 +45,39 @@ unsafe fn set_cookie_on_manager(
         .CookieManager()
         .map_err(|e| format!("CookieManager: {e}"))?;
 
+    let mut applied = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for stored in cookies {
+        if stored.name.is_empty() || stored.domain.is_empty() {
+            continue;
+        }
+        match set_one_cookie(&manager, stored) {
+            Ok(()) => applied += 1,
+            Err(e) => errors.push(e),
+        }
+    }
+
+    if applied == 0 {
+        if errors.is_empty() {
+            return Err("no cookies to apply".into());
+        }
+        return Err(errors.join("; "));
+    }
+    if !errors.is_empty() {
+        eprintln!(
+            "[cookies] webview2 applied {applied}, {} failed (e.g. {})",
+            errors.len(),
+            errors.first().map(String::as_str).unwrap_or("")
+        );
+    }
+    Ok(applied)
+}
+
+unsafe fn set_one_cookie(
+    manager: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2CookieManager,
+    stored: &StoredCookie,
+) -> Result<(), String> {
     let name = HSTRING::from(stored.name.as_str());
     let value = HSTRING::from(stored.value.as_str());
     let domain = HSTRING::from(stored.domain.as_str());
@@ -49,6 +86,8 @@ unsafe fn set_cookie_on_manager(
         .CreateCookie(&name, &value, &domain, &path)
         .map_err(|e| format!("CreateCookie {}: {e}", stored.name))?;
 
+    // SetExpires marks the cookie persistent so it survives WebView2 process death.
+    // Session cookies from Apple are given a TTL in cookies.json before restore.
     cookie
         .SetExpires(stored.expiration_date as f64)
         .map_err(|e| format!("SetExpires {}: {e}", stored.name))?;

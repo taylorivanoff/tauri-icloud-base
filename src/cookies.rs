@@ -11,6 +11,7 @@ use cookie::SameSite;
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use tauri_tray_base::Quitting;
+#[cfg(not(windows))]
 use time::{Duration, OffsetDateTime};
 
 #[cfg(windows)]
@@ -73,7 +74,9 @@ fn is_apple_auth_cookie_name(name: &str) -> bool {
 }
 
 /// Electron keeps Chromium's leading `.` on apex domain cookies. Tauri strips it.
-fn persist_domain(domain: &str) -> String {
+/// Without the leading `.`, WebView2 treats the cookie as host-only and it will
+/// not be sent to `www.icloud.com` / app subdomains after restore.
+pub(crate) fn persist_domain(domain: &str) -> String {
     let trimmed = domain.trim();
     if trimmed.starts_with('.') {
         return trimmed.to_ascii_lowercase();
@@ -84,6 +87,21 @@ fn persist_domain(domain: &str) -> String {
     } else {
         d
     }
+}
+
+fn normalize_stored_cookie(mut stored: StoredCookie) -> StoredCookie {
+    stored.domain = persist_domain(&stored.domain);
+    if stored.path.is_empty() {
+        stored.path = "/".into();
+    }
+    if stored.url.is_empty() {
+        stored.url = cookie_url(&stored.domain, &stored.path);
+    }
+    // Keep a future expiry so restored Apple session cookies stay persistent.
+    if stored.expiration_date <= now_unix() {
+        stored.expiration_date = now_unix() + SESSION_COOKIE_TTL_SECS;
+    }
+    stored
 }
 
 fn cookie_url(domain: &str, path: &str) -> String {
@@ -156,6 +174,7 @@ fn snapshot_apple_cookies(window: &WebviewWindow) -> Result<Vec<StoredCookie>, S
     Ok(all.iter().filter_map(serialize_cookie).collect())
 }
 
+#[cfg(not(windows))]
 fn to_tauri_cookie(stored: &StoredCookie) -> Cookie<'static> {
     let same_site = match stored.same_site.as_str() {
         "no_restriction" | "none" => SameSite::None,
@@ -176,22 +195,30 @@ fn to_tauri_cookie(stored: &StoredCookie) -> Cookie<'static> {
         .build()
 }
 
-fn apply_stored_cookie(window: &WebviewWindow, stored: &StoredCookie) -> bool {
+fn apply_stored_cookies(window: &WebviewWindow, cookies: &[StoredCookie]) -> Result<usize, String> {
     #[cfg(windows)]
     {
-        match cookies_webview2::set_stored_cookie(window, stored) {
-            Ok(()) => return true,
-            Err(e) => eprintln!(
-                "[cookies] webview2 set failed {}, falling back: {e}",
-                stored.name
-            ),
-        }
+        // Never fall back to Tauri `set_cookie` on Windows: it strips the leading
+        // `.` on apex domains, creating host-only cookies that www.icloud.com
+        // never receives — which looks like “logged out after restart”.
+        return cookies_webview2::set_stored_cookies(window, cookies);
     }
-    match window.set_cookie(to_tauri_cookie(stored)) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("[cookies] set failed {}: {e}", stored.name);
-            false
+    #[cfg(not(windows))]
+    {
+        let mut applied = 0usize;
+        for stored in cookies {
+            if stored.name.is_empty() || stored.domain.is_empty() {
+                continue;
+            }
+            match window.set_cookie(to_tauri_cookie(stored)) {
+                Ok(()) => applied += 1,
+                Err(e) => eprintln!("[cookies] set failed {}: {e}", stored.name),
+            }
+        }
+        if applied == 0 {
+            Err("no cookies applied".into())
+        } else {
+            Ok(applied)
         }
     }
 }
@@ -215,26 +242,33 @@ pub fn webview_has_apple_auth(window: &WebviewWindow) -> Result<bool, String> {
 /// Restore persisted Apple cookies into the webview. Call from a non-WebView2 UI thread.
 pub fn load_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result<bool, String> {
     let path = cookie_file_path(app)?;
-    let Some(cookies) = read_cookie_file(&path) else {
+    let Some(raw) = read_cookie_file(&path) else {
         return Ok(false);
     };
+    let cookies: Vec<StoredCookie> = raw.into_iter().map(normalize_stored_cookie).collect();
+    if cookies.is_empty() {
+        return Ok(false);
+    }
+    let disk_has_auth = has_apple_auth(&cookies);
 
     APPLYING.store(true, Ordering::SeqCst);
     let result = (|| {
-        let mut applied = 0usize;
-        for stored in &cookies {
-            if stored.name.is_empty() || stored.domain.is_empty() {
-                continue;
-            }
-            if apply_stored_cookie(window, stored) {
-                applied += 1;
-            }
-        }
+        let applied = apply_stored_cookies(window, &cookies)?;
         if let Ok(mut fp) = LAST_FINGERPRINT.lock() {
             *fp = fingerprint(&cookies);
         }
-        if applied == 0 {
-            return Err("no cookies applied".into());
+        // Cold boot can report a partial apply via a broken fallback; require the
+        // auth markers we persisted or keep retrying.
+        if disk_has_auth {
+            match webview_has_apple_auth(window) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err("auth cookies missing in webview after restore".into());
+                }
+                Err(e) => {
+                    return Err(format!("auth check after restore: {e}"));
+                }
+            }
         }
         eprintln!("[cookies] applied {applied} cookies from disk");
         Ok(true)
@@ -397,6 +431,25 @@ mod tests {
         assert_eq!(persist_domain("www.icloud.com"), "www.icloud.com");
         assert_eq!(persist_domain("idmsa.apple.com"), "idmsa.apple.com");
         assert_eq!(persist_domain("apple.com"), ".apple.com");
+    }
+
+    #[test]
+    fn normalize_restores_apex_dot_and_fresh_expiry() {
+        let stored = normalize_stored_cookie(StoredCookie {
+            url: String::new(),
+            name: "X-APPLE-WEBAUTH-TOKEN".into(),
+            value: "secret".into(),
+            domain: "icloud.com".into(),
+            path: String::new(),
+            secure: true,
+            http_only: true,
+            expiration_date: 1,
+            same_site: "lax".into(),
+        });
+        assert_eq!(stored.domain, ".icloud.com");
+        assert_eq!(stored.path, "/");
+        assert!(stored.expiration_date > now_unix());
+        assert!(stored.url.starts_with("https://icloud.com"));
     }
 
     #[test]
