@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
 use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
 use tauri::{
-    AppHandle, Context, Listener, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Context, Listener, Manager, RunEvent, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
 };
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
@@ -27,6 +29,10 @@ use url::Url;
 
 const SAFARI_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+
+pub(crate) const ICLOUD_HOST: &str = "www.icloud.com";
+pub(crate) const ICLOUD_CN_HOST: &str = "www.icloud.com.cn";
+const ICLOUD_HOST_SETTING: &str = "icloudHost";
 
 /// Safari UA makes iCloud request Apple fonts. Remap to Segoe UI on Windows WebView2.
 const FONT_FIX_SCRIPT: &str = r#"
@@ -64,36 +70,34 @@ const FONT_FIX_SCRIPT: &str = r#"
 })();
 "#;
 
-const TOOLBAR_REMOVE_SCRIPT: &str = r#"
+/// Hide Apple's toolbar without removing it. iCloud measures the toolbar's
+/// width to decide which buttons fit; deleting it (or using display:none) makes
+/// iCloud recreate it, which shows up as a partially visible bar.
+const TOOLBAR_HIDE_SCRIPT: &str = r#"
 (function () {
-  const SELECTORS = [
-    '.cloudos-toolbar-view',
-    'header.cloudos-toolbar.app',
-    'header.cloudos-toolbar'
-  ];
-  function removeToolbar(root) {
-    root = root || document;
-    for (const selector of SELECTORS) {
-      root.querySelectorAll?.(selector)?.forEach((el) => el.remove());
+  var STYLE_ID = 'icloud-win-toolbar-hide';
+  var css = [
+    '.cloudos-toolbar-view,header.cloudos-toolbar.app,header.cloudos-toolbar,',
+    '.cw-toolbar,header.cloudos-toolbar .toolbar-view,.cloudos-toolbar-view .toolbar-view,[class*="cloudos-toolbar"]{',
+    'position:absolute!important;top:0!important;left:0!important;width:100%!important;',
+    'height:0!important;min-height:0!important;max-height:0!important;',
+    'margin:0!important;padding:0!important;border:0!important;',
+    'opacity:0!important;visibility:hidden!important;pointer-events:none!important;',
+    'z-index:-1!important;',
+    '}'
+  ].join('');
+  function inject() {
+    var s = document.getElementById(STYLE_ID);
+    if (!s) {
+      s = document.createElement('style');
+      s.id = STYLE_ID;
+      (document.head || document.documentElement).appendChild(s);
     }
-    for (const frame of root.querySelectorAll?.('iframe') || []) {
-      try {
-        const doc = frame.contentDocument;
-        if (doc) removeToolbar(doc);
-      } catch (_) {}
-    }
+    s.textContent = css;
   }
-  removeToolbar();
+  inject();
   if (!window.__icloudBaseToolbarObserver) {
-    let scheduled = false;
-    window.__icloudBaseToolbarObserver = new MutationObserver(() => {
-      if (scheduled) return;
-      scheduled = true;
-      requestAnimationFrame(() => {
-        scheduled = false;
-        removeToolbar();
-      });
-    });
+    window.__icloudBaseToolbarObserver = new MutationObserver(inject);
     window.__icloudBaseToolbarObserver.observe(document.documentElement, {
       childList: true,
       subtree: true
@@ -114,16 +118,24 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
   var STYLE_ID = 'icloud-win-chrome-style';
   var ROOT_ID = 'icloud-win-chrome';
   var css = [
-    /* Collapse Apple's own top chrome — it leaves a dead gap under our bar */
+    /* Keep Apple's toolbar measurable but invisible — iCloud uses its width to
+       lay out toolbar buttons, and removing it makes it recreate half a bar. */
     '.cloudos-toolbar-view,header.cloudos-toolbar.app,header.cloudos-toolbar,',
-    '.cw-toolbar,.toolbar-view,[class*="cloudos-toolbar"]{',
-    'display:none!important;height:0!important;min-height:0!important;',
-    'margin:0!important;padding:0!important;overflow:hidden!important;border:0!important;',
+    '.cw-toolbar,header.cloudos-toolbar .toolbar-view,.cloudos-toolbar-view .toolbar-view,[class*="cloudos-toolbar"]{',
+    'position:absolute!important;top:0!important;left:0!important;width:100%!important;',
+    'height:0!important;min-height:0!important;max-height:0!important;',
+    'margin:0!important;padding:0!important;border:0!important;',
+    'opacity:0!important;visibility:hidden!important;pointer-events:none!important;',
+    'z-index:-1!important;',
     '}',
     'html{--icloud-win-chrome-h:28px;height:100%!important;overflow:hidden!important;}',
+    /* Reserve the bar with a border instead of padding. The transform makes
+       iCloud's position:fixed panes start below the bar instead of being
+       clipped by 28px at the bottom of the page. */
     'body{',
     'height:100%!important;max-height:100%!important;margin:0!important;',
-    'padding-top:var(--icloud-win-chrome-h)!important;box-sizing:border-box!important;',
+    'border-top:var(--icloud-win-chrome-h) solid transparent!important;',
+    'box-sizing:border-box!important;transform:translateZ(0)!important;',
     'overflow:hidden!important;',
     '}',
     '#' + ROOT_ID + '{',
@@ -152,6 +164,9 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     'display:inline-flex;align-items:center;justify-content:center;padding:0;',
     '-webkit-app-region:no-drag;app-region:no-drag;',
     '}',
+    '#' + ROOT_ID + ' .icloud-win-chrome-btn--refresh svg{',
+    'width:12px;height:12px;',
+    '}',
     '#' + ROOT_ID + ' .icloud-win-chrome-btn:hover{',
     'background:rgba(255,255,255,0.08);color:#fff;',
     '}',
@@ -175,22 +190,6 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     s.textContent = css;
   }
 
-  function stripAppleToolbar(root) {
-    root = root || document;
-    var selectors = [
-      '.cloudos-toolbar-view',
-      'header.cloudos-toolbar.app',
-      'header.cloudos-toolbar',
-      '.cw-toolbar',
-      '.toolbar-view'
-    ];
-    for (var i = 0; i < selectors.length; i++) {
-      root.querySelectorAll?.(selectors[i])?.forEach(function (el) {
-        el.remove();
-      });
-    }
-  }
-
   // Same-origin path — WebView2 always delivers NavigationStarting; we cancel it.
   // (Custom schemes are dropped; fake downloads triggered "download failed" toasts.)
   var CHROME_PATH = '/__icloud_win_chrome__/';
@@ -210,7 +209,6 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
 
   function ensureChrome() {
     ensureStyle();
-    stripAppleToolbar();
     var root = document.getElementById(ROOT_ID);
     if (root) return;
     root = document.createElement('div');
@@ -220,6 +218,8 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     root.innerHTML = [
       '<div class="icloud-win-chrome-drag" aria-hidden="true"></div>',
       '<div class="icloud-win-chrome-controls">',
+      '<button type="button" class="icloud-win-chrome-btn icloud-win-chrome-btn--refresh" data-action="refresh" title="Refresh" aria-label="Refresh">',
+      '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></button>',
       '<button type="button" class="icloud-win-chrome-btn" data-action="minimize" title="Minimize" aria-label="Minimize">',
       '<svg viewBox="0 0 10 10"><path fill="currentColor" d="M1 5h8v1H1z"/></svg></button>',
       '<button type="button" class="icloud-win-chrome-btn" data-action="maximize" title="Maximize" aria-label="Maximize">',
@@ -239,7 +239,9 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     }
     root.addEventListener('pointerdown', onControl, true);
     root.addEventListener('click', onControl, true);
-    (document.body || document.documentElement).appendChild(root);
+    // body is transformed to reserve the bar, which would make a fixed child
+    // relative to the content area. Keep the chrome outside that containing block.
+    (document.documentElement || document.body).appendChild(root);
   }
 
   function boot() {
@@ -273,7 +275,7 @@ const CHROME_PATH_MARKER: &str = "/__icloud_win_chrome__/";
 
 fn chrome_action_name(name: &str) -> Option<&str> {
     match name {
-        "minimize" | "maximize" | "close" => Some(name),
+        "minimize" | "maximize" | "close" | "refresh" => Some(name),
         _ => None,
     }
 }
@@ -287,9 +289,17 @@ fn chrome_action(url: &Url) -> Option<&str> {
     None
 }
 
-fn handle_chrome_action(app: &AppHandle, action: &str) {
+fn handle_chrome_action(app: &AppHandle, action: &str, url: &Url) {
     if action == "close" {
         hide_main(app);
+        return;
+    }
+    if action == "refresh" {
+        // Reuse the tray's refresh path: navigate back to the app URL so iCloud
+        // reloads its data instead of reloading a possibly stale sub-view.
+        let handle = app.clone();
+        let target = url.clone();
+        std::thread::spawn(move || refresh_page(&handle, target));
         return;
     }
     let handle = app.clone();
@@ -336,7 +346,109 @@ pub struct IcloudAppConfig {
 }
 
 fn parse_app_url(url: &str) -> Url {
-    Url::parse(url).unwrap_or_else(|_| Url::parse("https://www.icloud.com").expect("fallback"))
+    Url::parse(url)
+        .unwrap_or_else(|_| Url::parse(&format!("https://{ICLOUD_HOST}")).expect("fallback"))
+}
+
+/// The iCloud host the user actually signed in to. Mainland China accounts are
+/// routed to icloud.com.cn by Apple; restarting on www.icloud.com would look
+/// logged out and repeat the redirect/login loop.
+fn canonical_app_host(host: &str) -> Option<&'static str> {
+    match host.trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "icloud.com" | "www.icloud.com" => Some(ICLOUD_HOST),
+        "icloud.com.cn" | "www.icloud.com.cn" => Some(ICLOUD_CN_HOST),
+        _ => None,
+    }
+}
+
+fn app_url_with_host(url: &Url, host: &str) -> Option<Url> {
+    let mut next = url.clone();
+    next.set_host(Some(host)).ok()?;
+    Some(next)
+}
+
+fn saved_app_host(app: &AppHandle) -> Option<&'static str> {
+    let state = app.try_state::<TrayBaseState>()?;
+    let settings = state.settings.lock();
+    let host = settings.extra.get(ICLOUD_HOST_SETTING)?.as_str()?;
+    canonical_app_host(host)
+}
+
+fn remember_app_host(app: &AppHandle, host: &str) {
+    let Some(canonical) = canonical_app_host(host) else {
+        return;
+    };
+    let Some(state) = app.try_state::<TrayBaseState>() else {
+        return;
+    };
+    let mut settings = state.settings.lock();
+    if settings
+        .extra
+        .get(ICLOUD_HOST_SETTING)
+        .and_then(|v| v.as_str())
+        == Some(canonical)
+    {
+        return;
+    }
+    settings
+        .extra
+        .insert(ICLOUD_HOST_SETTING.into(), json!(canonical));
+    if let Err(e) = save_settings(&state.settings_path, &settings) {
+        eprintln!("[icloud] save host preference: {e}");
+    }
+}
+
+/// Drop a remembered region when the user signs out, so switching Apple IDs
+/// does not keep sending the app to a host that belongs to the old account.
+fn forget_app_host(app: &AppHandle) {
+    let Some(state) = app.try_state::<TrayBaseState>() else {
+        return;
+    };
+    let mut settings = state.settings.lock();
+    if settings.extra.remove(ICLOUD_HOST_SETTING).is_none() {
+        return;
+    }
+    if let Err(e) = save_settings(&state.settings_path, &settings) {
+        eprintln!("[icloud] clear host preference: {e}");
+    }
+}
+
+/// Resolve the configured app URL against the remembered (or inferred) region.
+fn resolve_app_url(app: &AppHandle, configured: &str) -> Url {
+    let base = parse_app_url(configured);
+    // Auth cookies are stronger evidence than a preference written before Apple
+    // redirected the user to their regional host.
+    let Some(host) = cookies::persisted_icloud_host(app).or_else(|| saved_app_host(app)) else {
+        return base;
+    };
+    if let Some(next) = app_url_with_host(&base, host) {
+        // Persist the inferred host so later launches skip the cookie scan.
+        remember_app_host(app, host);
+        return next;
+    }
+    base
+}
+
+type SharedAppUrl = Arc<Mutex<Url>>;
+
+fn current_app_url(shared: &SharedAppUrl) -> Url {
+    shared.lock().unwrap().clone()
+}
+
+/// Switch the in-memory target when Apple redirects the user to their regional
+/// iCloud host, so Refresh and post-sign-in restores stay on that host.
+fn set_app_url(app: &AppHandle, shared: &SharedAppUrl, host: &str) {
+    let Some(canonical) = canonical_app_host(host) else {
+        return;
+    };
+    remember_app_host(app, canonical);
+    let mut current = shared.lock().unwrap();
+    if current.host_str() == Some(canonical) {
+        return;
+    }
+    if let Some(next) = app_url_with_host(&current, canonical) {
+        *current = next;
+    }
 }
 
 fn unique_download_path(path: PathBuf) -> PathBuf {
@@ -405,19 +517,14 @@ fn notify_download(app: &AppHandle, app_name: &str, path: Option<&Path>, success
             format!("Could not download {file_name}"),
         )
     };
-    let _ = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show();
+    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 fn is_icloud_home_redirect(url: &Url, app_url: &Url) -> bool {
     let Some(app_host) = app_url.host_str() else {
         return false;
     };
-    if !(app_host == "www.icloud.com" || app_host == "icloud.com") {
+    if canonical_app_host(app_host).is_none() {
         return false;
     }
     let app_path = app_url.path().trim_end_matches('/');
@@ -428,7 +535,7 @@ fn is_icloud_home_redirect(url: &Url, app_url: &Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
-    if !(host == "www.icloud.com" || host == "icloud.com") {
+    if canonical_app_host(host).is_none() {
         return false;
     }
     let path = url.path().trim_end_matches('/');
@@ -443,8 +550,7 @@ fn persist_cookies(app: &AppHandle) {
     }
 }
 
-const RESTORE_RETRY_DELAYS_MS: [u64; 10] =
-    [50, 100, 200, 400, 800, 1600, 3200, 5000, 8000, 12000];
+const RESTORE_RETRY_DELAYS_MS: [u64; 10] = [50, 100, 200, 400, 800, 1600, 3200, 5000, 8000, 12000];
 
 fn is_apple_family_url(url: &Url) -> bool {
     url.host_str()
@@ -453,9 +559,18 @@ fn is_apple_family_url(url: &Url) -> bool {
 }
 
 fn is_apple_sign_in_url(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('.').to_ascii_lowercase();
     matches!(
-        url.host_str(),
-        Some("idmsa.apple.com") | Some("appleid.apple.com") | Some("signin.apple.com")
+        host.as_str(),
+        "idmsa.apple.com"
+            | "appleid.apple.com"
+            | "signin.apple.com"
+            | "idmsa.apple.com.cn"
+            | "appleid.apple.com.cn"
+            | "signin.apple.com.cn"
     )
 }
 
@@ -503,6 +618,7 @@ fn sign_out(app: AppHandle, url: Url) {
         if let Err(e) = cookies::clear_session(&app, &window) {
             eprintln!("[cookies] sign out: {e}");
         }
+        forget_app_host(&app);
         std::thread::sleep(Duration::from_millis(50));
         if let Err(e) = window.navigate(url) {
             eprintln!("[cookies] navigate after sign out: {e}");
@@ -511,7 +627,11 @@ fn sign_out(app: AppHandle, url: Url) {
     });
 }
 
-fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<WebviewWindow> {
+fn build_main_window(
+    app: &AppHandle,
+    config: IcloudAppConfig,
+    target: &SharedAppUrl,
+) -> tauri::Result<WebviewWindow> {
     let app_data = app
         .path()
         .app_data_dir()
@@ -519,16 +639,17 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
     let webview_data = app_data.join("webview");
     let _ = std::fs::create_dir_all(&webview_data);
 
-    let app_url = parse_app_url(config.url);
     let blank_url = Url::parse("about:blank").expect("about:blank");
     let app_for_nav = app.clone();
     let app_for_chrome = app.clone();
     let app_for_chrome_nw = app.clone();
+    let chrome_nav_target = target.clone();
     let app_for_open = app.clone();
     let app_for_download = app.clone();
     let app_for_cookies = app.clone();
     let app_for_auth_window = app.clone();
-    let nav_target = app_url.clone();
+    let page_load_target = target.clone();
+    let nav_target = target.clone();
     let app_name = config.app_name;
 
     let mut builder =
@@ -540,7 +661,7 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
             .user_agent(SAFARI_UA)
             .data_directory(webview_data)
             .initialization_script_for_all_frames(FONT_FIX_SCRIPT)
-            .initialization_script_for_all_frames(TOOLBAR_REMOVE_SCRIPT);
+            .initialization_script_for_all_frames(TOOLBAR_HIDE_SCRIPT);
 
     // Frameless before create — set_decorations(false) after build can lose to the
     // initial Win32 frame, which stacks native caption buttons under our chrome.
@@ -555,12 +676,15 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
     let window = builder
         .on_page_load(move |window, payload| {
             let _ = window.eval(FONT_FIX_SCRIPT);
-            let _ = window.eval(TOOLBAR_REMOVE_SCRIPT);
+            let _ = window.eval(TOOLBAR_HIDE_SCRIPT);
             #[cfg(windows)]
             {
                 let _ = window.eval(WINDOW_CHROME_SCRIPT);
             }
             if payload.event() == PageLoadEvent::Finished && is_apple_family_url(payload.url()) {
+                if let Some(host) = payload.url().host_str() {
+                    set_app_url(&app_for_cookies, &page_load_target, host);
+                }
                 let app = app_for_cookies.clone();
                 let win = window.clone();
                 std::thread::spawn(move || {
@@ -572,12 +696,15 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
         })
         .on_navigation(move |url| {
             if let Some(action) = chrome_action(url) {
-                handle_chrome_action(&app_for_chrome, action);
+                handle_chrome_action(&app_for_chrome, action, &current_app_url(&nav_target));
                 return false;
             }
-            if is_icloud_home_redirect(url, &nav_target) {
+            if let Some(host) = url.host_str() {
+                set_app_url(&app_for_nav, &nav_target, host);
+            }
+            let target = current_app_url(&nav_target);
+            if is_icloud_home_redirect(url, &target) {
                 let handle = app_for_nav.clone();
-                let target = nav_target.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     let Some(w) = handle.get_webview_window(MAIN_WINDOW_LABEL) else {
@@ -606,8 +733,15 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
         })
         .on_new_window(move |url, _features| {
             if let Some(action) = chrome_action(&url) {
-                handle_chrome_action(&app_for_chrome_nw, action);
+                handle_chrome_action(
+                    &app_for_chrome_nw,
+                    action,
+                    &current_app_url(&chrome_nav_target),
+                );
                 return NewWindowResponse::Deny;
+            }
+            if let Some(host) = url.host_str() {
+                set_app_url(&app_for_auth_window, &chrome_nav_target, host);
             }
             // Apple ID sign-in often window.open()s idmsa. Keep it in this webview
             // instead of the system browser (which leaves the app stuck on Sign In).
@@ -638,9 +772,9 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
         let _ = window.set_shadow(true);
         // Frameless WebView2 can show the desktop through page chrome unless the
         // controller has an opaque default background.
-        let _ = window.set_background_color(Some(
-            tauri::window::Color::from((255u8, 255u8, 255u8, 255u8)),
-        ));
+        let _ = window.set_background_color(Some(tauri::window::Color::from((
+            255u8, 255u8, 255u8, 255u8,
+        ))));
     }
 
     Ok(window)
@@ -650,9 +784,8 @@ fn build_main_window(app: &AppHandle, config: IcloudAppConfig) -> tauri::Result<
 ///
 /// `context` must come from the **app** crate via `tauri::generate_context!()`.
 pub fn run(config: IcloudAppConfig, context: Context) {
-    let app_url = parse_app_url(config.url);
-    let builder = with_common_plugins(tauri::Builder::default())
-        .plugin(tauri_plugin_notification::init());
+    let builder =
+        with_common_plugins(tauri::Builder::default()).plugin(tauri_plugin_notification::init());
 
     builder
         .setup(move |app| {
@@ -680,7 +813,9 @@ pub fn run(config: IcloudAppConfig, context: Context) {
                 },
             )?;
 
-            let window = build_main_window(&handle, config)?;
+            let app_url = resolve_app_url(&handle, config.url);
+            let target = Arc::new(Mutex::new(app_url.clone()));
+            let window = build_main_window(&handle, config, &target)?;
 
             setup_tray(
                 &handle,
@@ -704,11 +839,11 @@ pub fn run(config: IcloudAppConfig, context: Context) {
             restore_session_then_navigate(handle.clone(), window, app_url.clone());
 
             let action_handle = handle.clone();
-            let action_url = app_url.clone();
+            let action_target = target.clone();
             handle.listen("tray:action", move |event| {
                 match event.payload().trim_matches('"') {
-                    "refresh" => refresh_page(&action_handle, action_url.clone()),
-                    "sign-out" => sign_out(action_handle.clone(), action_url.clone()),
+                    "refresh" => refresh_page(&action_handle, current_app_url(&action_target)),
+                    "sign-out" => sign_out(action_handle.clone(), current_app_url(&action_target)),
                     _ => {}
                 }
             });
@@ -746,4 +881,46 @@ pub fn run(config: IcloudAppConfig, context: Context) {
                     });
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_host_normalizes_china_and_standard() {
+        assert_eq!(canonical_app_host("www.icloud.com"), Some(ICLOUD_HOST));
+        assert_eq!(canonical_app_host("icloud.com"), Some(ICLOUD_HOST));
+        assert_eq!(
+            canonical_app_host("www.icloud.com.cn"),
+            Some(ICLOUD_CN_HOST)
+        );
+        assert_eq!(canonical_app_host(".icloud.com.cn"), Some(ICLOUD_CN_HOST));
+        assert_eq!(canonical_app_host("www.example.com"), None);
+    }
+
+    #[test]
+    fn app_url_with_host_keeps_the_app_path() {
+        let url = parse_app_url("https://www.icloud.com/reminders");
+        let china = app_url_with_host(&url, ICLOUD_CN_HOST).expect("china url");
+        assert_eq!(china.as_str(), "https://www.icloud.com.cn/reminders");
+    }
+
+    #[test]
+    fn home_redirect_is_detected_on_china_domain() {
+        let target = parse_app_url("https://www.icloud.com.cn/reminders");
+        let root = parse_app_url("https://www.icloud.com.cn/");
+        assert!(is_icloud_home_redirect(&root, &target));
+
+        let app_page = parse_app_url("https://www.icloud.com.cn/reminders");
+        assert!(!is_icloud_home_redirect(&app_page, &target));
+    }
+
+    #[test]
+    fn china_apple_sign_in_hosts_are_recognized() {
+        let sign_in = parse_app_url("https://idmsa.apple.com.cn/appleauth/auth/signin");
+        assert!(is_apple_sign_in_url(&sign_in));
+        let icloud_cn = parse_app_url("https://www.icloud.com.cn/");
+        assert!(!is_apple_sign_in_url(&icloud_cn));
+    }
 }

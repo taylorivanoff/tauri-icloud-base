@@ -1,13 +1,13 @@
 //! Apple cookie persistence — mirrors electron icloud-windows-base/cookies.js.
 //! Session cookies (no expiry from Apple) get a ~180-day TTL so they survive quit.
 
+use cookie::SameSite;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use cookie::SameSite;
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use tauri_tray_base::Quitting;
@@ -48,8 +48,37 @@ pub fn cookie_file_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 pub fn is_apple_family_domain(domain: &str) -> bool {
-    let d = domain.to_ascii_lowercase();
-    d.contains("icloud.com") || d.contains("apple.com")
+    let d = domain.trim_start_matches('.').to_ascii_lowercase();
+    ["icloud.com", "apple.com", "icloud.com.cn", "apple.com.cn"]
+        .iter()
+        .any(|suffix| d == *suffix || d.ends_with(&format!(".{suffix}")))
+}
+
+/// Mainland China uses icloud.com.cn / apple.com.cn. Cookies from those hosts
+/// belong to a different account region than www.icloud.com.
+fn is_china_apple_domain(domain: &str) -> bool {
+    let d = domain.trim_start_matches('.').to_ascii_lowercase();
+    d == "icloud.com.cn"
+        || d.ends_with(".icloud.com.cn")
+        || d == "apple.com.cn"
+        || d.ends_with(".apple.com.cn")
+}
+
+fn icloud_host_from_cookies(cookies: &[StoredCookie]) -> Option<&'static str> {
+    let china_auth = cookies
+        .iter()
+        .any(|c| is_china_apple_domain(&c.domain) && is_apple_session_cookie_name(&c.name));
+    china_auth.then_some(crate::ICLOUD_CN_HOST)
+}
+
+/// Existing installs may have a China session but no saved host preference.
+/// Infer the region from the persisted auth cookies so the first launch after
+/// upgrading does not navigate to www.icloud.com and force another login.
+pub fn persisted_icloud_host(app: &AppHandle) -> Option<&'static str> {
+    let path = cookie_file_path(app).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    let cookies: Vec<StoredCookie> = serde_json::from_str(&raw).ok()?;
+    icloud_host_from_cookies(&cookies)
 }
 
 fn now_unix() -> i64 {
@@ -66,11 +95,16 @@ fn ensure_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn is_apple_auth_cookie_name(name: &str) -> bool {
+/// Only a full web-session cookie proves the user is actually signed in.
+///
+/// Apple sets account identifiers (`MYACINFO`, `AASP`, `ACN01`, `DES`, `DSID`)
+/// and device-trust cookies (`X-APPLE-WEBAUTH-HSA-TRUST`, `-USER`, `-REPAIR`,
+/// PCS cookies) before a usable session exists. Treating those as auth lets a
+/// logged-out or partial snapshot overwrite a valid `cookies.json`, so the app
+/// looks signed out again on the next restart.
+fn is_apple_session_cookie_name(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
-    n.starts_with("X-APPLE-WEBAUTH")
-        || n.starts_with("X-APPLE-DS-WEB-SESSION")
-        || matches!(n.as_str(), "MYACINFO" | "AASP" | "ACN01" | "DES" | "DSID")
+    n == "X-APPLE-WEBAUTH-TOKEN" || n == "X-APPLE-DS-WEB-SESSION-TOKEN"
 }
 
 /// Electron keeps Chromium's leading `.` on apex domain cookies. Tauri strips it.
@@ -82,7 +116,10 @@ pub(crate) fn persist_domain(domain: &str) -> String {
         return trimmed.to_ascii_lowercase();
     }
     let d = trimmed.to_ascii_lowercase();
-    if d == "icloud.com" || d == "apple.com" {
+    if matches!(
+        d.as_str(),
+        "icloud.com" | "apple.com" | "icloud.com.cn" | "apple.com.cn"
+    ) {
         format!(".{d}")
     } else {
         d
@@ -111,7 +148,9 @@ fn cookie_url(domain: &str, path: &str) -> String {
 }
 
 pub fn has_apple_auth(cookies: &[StoredCookie]) -> bool {
-    cookies.iter().any(|c| is_apple_auth_cookie_name(&c.name))
+    cookies
+        .iter()
+        .any(|c| is_apple_session_cookie_name(&c.name))
 }
 
 /// Never overwrite on-disk auth cookies with a logged-out webview snapshot.
@@ -168,9 +207,7 @@ fn serialize_cookie(cookie: &Cookie<'_>) -> Option<StoredCookie> {
 }
 
 fn snapshot_apple_cookies(window: &WebviewWindow) -> Result<Vec<StoredCookie>, String> {
-    let all = window
-        .cookies()
-        .map_err(|e| format!("cookies(): {e}"))?;
+    let all = window.cookies().map_err(|e| format!("cookies(): {e}"))?;
     Ok(all.iter().filter_map(serialize_cookie).collect())
 }
 
@@ -307,7 +344,10 @@ pub fn save_persisted_cookies(app: &AppHandle, window: &WebviewWindow) -> Result
 }
 
 /// Persist cookies immediately when the webview shows an authenticated session.
-pub fn save_persisted_cookies_if_authed(app: &AppHandle, window: &WebviewWindow) -> Result<(), String> {
+pub fn save_persisted_cookies_if_authed(
+    app: &AppHandle,
+    window: &WebviewWindow,
+) -> Result<(), String> {
     if !webview_has_apple_auth(window)? {
         return Ok(());
     }
@@ -346,23 +386,23 @@ pub fn clear_session(app: &AppHandle, window: &WebviewWindow) -> Result<(), Stri
 }
 
 fn is_quitting(app: &AppHandle) -> bool {
-    app.try_state::<Quitting>().map(|q| q.get()).unwrap_or(false)
+    app.try_state::<Quitting>()
+        .map(|q| q.get())
+        .unwrap_or(false)
 }
 
 /// Periodic poll so we catch auth cookies without a cookie-changed event.
 pub fn start_cookie_poller(app: AppHandle, window: WebviewWindow) {
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            if is_quitting(&app) {
-                break;
-            }
-            if APPLYING.load(Ordering::SeqCst) {
-                continue;
-            }
-            if let Err(e) = save_persisted_cookies(&app, &window) {
-                eprintln!("[cookies] poll: {e}");
-            }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        if is_quitting(&app) {
+            break;
+        }
+        if APPLYING.load(Ordering::SeqCst) {
+            continue;
+        }
+        if let Err(e) = save_persisted_cookies(&app, &window) {
+            eprintln!("[cookies] poll: {e}");
         }
     });
 }
@@ -392,17 +432,40 @@ mod tests {
         fs::write(path, json).unwrap();
     }
 
+    fn weak_cookie(name: &str) -> StoredCookie {
+        StoredCookie {
+            name: name.into(),
+            ..sample_auth_cookie()
+        }
+    }
+
     #[test]
-    fn has_apple_auth_recognizes_common_markers() {
+    fn has_apple_auth_requires_a_full_session_cookie() {
         assert!(has_apple_auth(&[sample_auth_cookie()]));
-        assert!(has_apple_auth(&[StoredCookie {
-            name: "aasp".into(),
-            ..sample_auth_cookie()
-        }]));
-        assert!(!has_apple_auth(&[StoredCookie {
-            name: "pref".into(),
-            ..sample_auth_cookie()
-        }]));
+        assert!(has_apple_auth(&[weak_cookie(
+            "x-apple-ds-web-session-token"
+        )]));
+
+        // Apple can leave a device-trust/partial jar after 2FA or a pending
+        // Terms & Conditions prompt. Those cookies are not a web session.
+        for name in [
+            "MYACINFO",
+            "aasp",
+            "acn01",
+            "DES123",
+            "DSID",
+            "X-APPLE-WEBAUTH-USER",
+            "X-APPLE-WEBAUTH-HSA-TRUST",
+            "X-APPLE-WEBAUTH-REPAIR",
+            "X-APPLE-WEBAUTH-PCS-Notes",
+            "X-APPLE-DS-WEB-SESSION",
+            "pref",
+        ] {
+            assert!(
+                !has_apple_auth(&[weak_cookie(name)]),
+                "{name} is not proof of an iCloud session"
+            );
+        }
     }
 
     #[test]
@@ -412,14 +475,21 @@ mod tests {
         write_cookie_file(&path, &[sample_auth_cookie()]);
 
         assert!(should_skip_auth_clobber(&path, &[]));
+        assert!(should_skip_auth_clobber(&path, &[weak_cookie("MYACINFO")]));
         assert!(should_skip_auth_clobber(
             &path,
-            &[StoredCookie {
-                name: "pref".into(),
-                ..sample_auth_cookie()
-            }]
+            &[
+                weak_cookie("X-APPLE-WEBAUTH-USER"),
+                weak_cookie("X-APPLE-WEBAUTH-HSA-TRUST"),
+                weak_cookie("X-APPLE-WEBAUTH-REPAIR"),
+            ]
         ));
         assert!(!should_skip_auth_clobber(&path, &[sample_auth_cookie()]));
+
+        // Weak identifiers alone must never protect a stale file; the user has
+        // signed out and a fresh snapshot should be allowed to replace it.
+        write_cookie_file(&path, &[weak_cookie("MYACINFO")]);
+        assert!(!should_skip_auth_clobber(&path, &[]));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -431,6 +501,53 @@ mod tests {
         assert_eq!(persist_domain("www.icloud.com"), "www.icloud.com");
         assert_eq!(persist_domain("idmsa.apple.com"), "idmsa.apple.com");
         assert_eq!(persist_domain("apple.com"), ".apple.com");
+        assert_eq!(persist_domain("icloud.com.cn"), ".icloud.com.cn");
+        assert_eq!(persist_domain(".icloud.com.cn"), ".icloud.com.cn");
+        assert_eq!(persist_domain("www.icloud.com.cn"), "www.icloud.com.cn");
+        assert_eq!(persist_domain("idmsa.apple.com.cn"), "idmsa.apple.com.cn");
+        assert_eq!(persist_domain("apple.com.cn"), ".apple.com.cn");
+    }
+
+    #[test]
+    fn apple_family_domains_include_china_and_exclude_lookalikes() {
+        for domain in [
+            "www.icloud.com",
+            ".icloud.com",
+            "idmsa.apple.com",
+            "www.icloud.com.cn",
+            ".icloud.com.cn",
+            "idmsa.apple.com.cn",
+        ] {
+            assert!(is_apple_family_domain(domain), "{domain}");
+        }
+        assert!(!is_apple_family_domain("icloud.com.example.com"));
+        assert!(!is_apple_family_domain("notapple.com"));
+    }
+
+    #[test]
+    fn china_auth_cookies_select_china_icloud_host() {
+        assert_eq!(
+            icloud_host_from_cookies(&[StoredCookie {
+                domain: ".icloud.com.cn".into(),
+                ..sample_auth_cookie()
+            }]),
+            Some(crate::ICLOUD_CN_HOST)
+        );
+        assert_eq!(
+            icloud_host_from_cookies(&[StoredCookie {
+                domain: "MYACINFO.example.net".into(),
+                ..sample_auth_cookie()
+            }]),
+            None
+        );
+        assert_eq!(
+            icloud_host_from_cookies(&[StoredCookie {
+                domain: ".icloud.com.cn".into(),
+                ..weak_cookie("MYACINFO")
+            }]),
+            None
+        );
+        assert_eq!(icloud_host_from_cookies(&[sample_auth_cookie()]), None);
     }
 
     #[test]

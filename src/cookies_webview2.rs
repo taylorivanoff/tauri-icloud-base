@@ -38,9 +38,7 @@ unsafe fn set_cookies_on_manager(
         .controller()
         .CoreWebView2()
         .map_err(|e| format!("CoreWebView2: {e}"))?;
-    let core2: ICoreWebView2_2 = core
-        .cast()
-        .map_err(|e| format!("ICoreWebView2_2: {e}"))?;
+    let core2: ICoreWebView2_2 = core.cast().map_err(|e| format!("ICoreWebView2_2: {e}"))?;
     let manager = core2
         .CookieManager()
         .map_err(|e| format!("CookieManager: {e}"))?;
