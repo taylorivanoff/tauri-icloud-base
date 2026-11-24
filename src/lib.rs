@@ -118,7 +118,7 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
   var STYLE_ID = 'icloud-win-chrome-style';
   var ROOT_ID = 'icloud-win-chrome';
   var css = [
-    /* Keep Apple's toolbar measurable but invisible — iCloud uses its width to
+    /* Keep Apple's toolbar measurable but invisible - iCloud uses its width to
        lay out toolbar buttons, and removing it makes it recreate half a bar. */
     '.cloudos-toolbar-view,header.cloudos-toolbar.app,header.cloudos-toolbar,',
     '.cw-toolbar,header.cloudos-toolbar .toolbar-view,.cloudos-toolbar-view .toolbar-view,[class*="cloudos-toolbar"]{',
@@ -146,7 +146,7 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     'border-bottom:1px solid rgba(255,255,255,0.08);',
     'font-family:"Segoe UI",system-ui,sans-serif;',
     '}',
-    /* Drag only on the filler — nesting no-drag buttons under drag is flaky on WebView2 */
+    /* Drag only on the filler - nesting no-drag buttons under drag is flaky on WebView2 */
     '#' + ROOT_ID + ' .icloud-win-chrome-drag{',
     'flex:1 1 auto;min-width:0;pointer-events:auto;',
     '-webkit-app-region:drag;app-region:drag;',
@@ -190,7 +190,7 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     s.textContent = css;
   }
 
-  // Same-origin path — WebView2 always delivers NavigationStarting; we cancel it.
+  // Same-origin path - WebView2 always delivers NavigationStarting; we cancel it.
   // (Custom schemes are dropped; fake downloads triggered "download failed" toasts.)
   var CHROME_PATH = '/__icloud_win_chrome__/';
   var lastActionAt = 0;
@@ -341,7 +341,7 @@ fn force_full_opacity(app: &AppHandle) {
 pub struct IcloudAppConfig {
     pub app_name: &'static str,
     pub url: &'static str,
-    /// Unused — Apple's cloudos toolbar is always stripped.
+    /// Unused - Apple's cloudos toolbar is always stripped.
     pub remove_toolbar: bool,
 }
 
@@ -663,7 +663,7 @@ fn build_main_window(
             .initialization_script_for_all_frames(FONT_FIX_SCRIPT)
             .initialization_script_for_all_frames(TOOLBAR_HIDE_SCRIPT);
 
-    // Frameless before create — set_decorations(false) after build can lose to the
+    // Frameless before create - set_decorations(false) after build can lose to the
     // initial Win32 frame, which stacks native caption buttons under our chrome.
     #[cfg(windows)]
     {
@@ -714,7 +714,7 @@ fn build_main_window(
                         let _ = w.navigate(target);
                     }
                 });
-                // Never cancel `/` — Apple ID sign-in returns here. Cancelling it
+                // Never cancel `/` - Apple ID sign-in returns here. Cancelling it
                 // loops the user back to the Sign In button.
                 return true;
             }

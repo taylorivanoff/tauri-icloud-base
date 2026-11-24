@@ -1,4 +1,4 @@
-//! Apple cookie persistence — mirrors electron icloud-windows-base/cookies.js.
+//! Apple cookie persistence - mirrors electron icloud-windows-base/cookies.js.
 //! Session cookies (no expiry from Apple) get a ~180-day TTL so they survive quit.
 
 use cookie::SameSite;
@@ -237,7 +237,7 @@ fn apply_stored_cookies(window: &WebviewWindow, cookies: &[StoredCookie]) -> Res
     {
         // Never fall back to Tauri `set_cookie` on Windows: it strips the leading
         // `.` on apex domains, creating host-only cookies that www.icloud.com
-        // never receives — which looks like “logged out after restart”.
+        // never receives - which looks like “logged out after restart”.
         return cookies_webview2::set_stored_cookies(window, cookies);
     }
     #[cfg(not(windows))]
