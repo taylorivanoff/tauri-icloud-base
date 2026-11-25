@@ -93,11 +93,24 @@ const TOOLBAR_HIDE_SCRIPT: &str = r#"
       s.id = STYLE_ID;
       (document.head || document.documentElement).appendChild(s);
     }
-    s.textContent = css;
+    // Assigning textContent always mutates the DOM, even when the value is
+    // unchanged. The observer below watches this style node, so writing it on
+    // every callback creates an infinite MutationObserver loop that starves the
+    // renderer and leaves a blank window.
+    if (s.textContent !== css) {
+      s.textContent = css;
+    }
   }
   inject();
   if (!window.__icloudBaseToolbarObserver) {
-    window.__icloudBaseToolbarObserver = new MutationObserver(inject);
+    window.__icloudBaseToolbarObserver = new MutationObserver(function () {
+      if (window.__icloudBaseToolbarPending) return;
+      window.__icloudBaseToolbarPending = true;
+      requestAnimationFrame(function () {
+        window.__icloudBaseToolbarPending = false;
+        inject();
+      });
+    });
     window.__icloudBaseToolbarObserver.observe(document.documentElement, {
       childList: true,
       subtree: true
@@ -138,6 +151,11 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
     'box-sizing:border-box!important;transform:translateZ(0)!important;',
     'overflow:hidden!important;',
     '}',
+    /* iCloud sizes some panes with 100vh, which ignores the 28px taken by the
+       bar above. Cap top-level panes to the available box so controls pinned
+       to the bottom (e.g. Reminders' "Add List") stay reachable. */
+    'body > *{max-height:100%!important;box-sizing:border-box!important;}',
+    '[style*="100vh"]{max-height:calc(100vh - var(--icloud-win-chrome-h))!important;}',
     '#' + ROOT_ID + '{',
     'position:fixed;top:0;left:0;right:0;height:var(--icloud-win-chrome-h);z-index:2147483646;',
     'display:flex;align-items:stretch;justify-content:flex-end;',
@@ -187,7 +205,11 @@ const WINDOW_CHROME_SCRIPT: &str = r#"
       s.id = STYLE_ID;
       (document.head || document.documentElement).appendChild(s);
     }
-    s.textContent = css;
+    // See TOOLBAR_HIDE_SCRIPT: an unconditional write here would feed the
+    // observer below and keep the page in a permanent rAF loop.
+    if (s.textContent !== css) {
+      s.textContent = css;
+    }
   }
 
   // Same-origin path - WebView2 always delivers NavigationStarting; we cancel it.
@@ -639,7 +661,6 @@ fn build_main_window(
     let webview_data = app_data.join("webview");
     let _ = std::fs::create_dir_all(&webview_data);
 
-    let blank_url = Url::parse("about:blank").expect("about:blank");
     let app_for_nav = app.clone();
     let app_for_chrome = app.clone();
     let app_for_chrome_nw = app.clone();
@@ -652,8 +673,11 @@ fn build_main_window(
     let nav_target = target.clone();
     let app_name = config.app_name;
 
+    // Start on the bundled loading page instead of about:blank. about:blank is a
+    // bare frameless surface with no injected window chrome, so it shows up as a
+    // grey, titlebar-less window while the session restore/navigation runs.
     let mut builder =
-        WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::External(blank_url))
+        WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
             .title(config.app_name)
             .inner_size(1280.0, 800.0)
             .resizable(true)
